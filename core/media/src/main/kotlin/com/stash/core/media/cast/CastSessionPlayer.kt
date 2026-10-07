@@ -297,6 +297,9 @@ class CastSessionPlayer(
             }
         }
 
+        // The deprecated, flag-less volume commands too: controllers built
+        // against older media3 versions still send those.
+        @Suppress("DEPRECATION")
         val commands = base.availableCommands.buildUpon()
             .removeAll(Player.COMMAND_SET_SPEED_AND_PITCH, Player.COMMAND_SET_VOLUME)
             .addAll(
