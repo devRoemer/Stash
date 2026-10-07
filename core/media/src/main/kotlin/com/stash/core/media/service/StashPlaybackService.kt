@@ -116,6 +116,9 @@ class StashPlaybackService : MediaLibraryService() {
     @Inject lateinit var sharePreference: com.stash.core.data.share.SharePreference
     @Inject lateinit var playbackStateStore: com.stash.core.media.PlaybackStateStore
 
+    /** Google Cast (spec 2026-10-06). */
+    @Inject lateinit var castDevices: com.stash.core.media.cast.CastDevices
+
     companion object {
         /** Custom command action for toggling shuffle mode. */
         const val COMMAND_TOGGLE_SHUFFLE = "com.stash.TOGGLE_SHUFFLE"
@@ -242,6 +245,15 @@ class StashPlaybackService : MediaLibraryService() {
          * measured cost of that was ~10 mA around the clock.
          */
         internal const val IDLE_STOP_TIMEOUT_MS = 5 * 60_000L
+
+        /**
+         * Idle stop while casting. Stopping the service ends the cast session
+         * (the speaker drops back to its idle screen and has to be picked
+         * again), so a paused speaker gets longer than the phone does: long
+         * enough for a phone call or dinner, not forever. The cost of waiting
+         * is the wake and Wi-Fi locks the cast holds.
+         */
+        internal const val CAST_IDLE_STOP_TIMEOUT_MS = 30 * 60_000L
     }
 
     private var mediaSession: MediaLibrarySession? = null
@@ -296,6 +308,26 @@ class StashPlaybackService : MediaLibraryService() {
     /** The player [playerListener] is currently attached to (moves on swap). */
     private var listenedPlayer: Player? = null
 
+    /** Built in [onCreate]; kept so the cast media server reads songs through the same routing. */
+    private var mediaSourceFactory: StashMediaSourceFactory? = null
+
+    /**
+     * Casting (spec 2026-10-06 §3). [castPlayer] is the session's player while
+     * [isCasting]; the master sits stopped underneath it. One instance per
+     * service, like [togetherPlayer].
+     */
+    private var castPlayer: com.stash.core.media.cast.CastSessionPlayer? = null
+    private var castServer: com.stash.core.media.cast.CastMediaServer? = null
+    private var castWakeLock: android.os.PowerManager.WakeLock? = null
+    private var castWifiLock: android.net.wifi.WifiManager.WifiLock? = null
+    private val isCasting: Boolean get() = castPlayer?.isAttached == true
+
+    /** When the cast player last became idle (elapsedRealtime), or null while it plays. */
+    private var castIdleSinceMs: Long? = null
+
+    /** The player that is actually making sound: the speaker's while casting, else the master. */
+    private val activePlayer: Player? get() = castPlayer?.takeIf { it.isAttached } ?: crossfadeEngine?.masterPlayer
+
     /**
      * Feed for [idleStopTicker]: true while the master player is idle (see
      * [isPlayerIdle]). Starts true — a service created without playback
@@ -341,6 +373,8 @@ class StashPlaybackService : MediaLibraryService() {
             updateCustomLayout()
             onTrackTransitionForLoudness(mediaItem)
             prefetchOrchestrator.resetSession()
+            // While casting the master is stopped; castListener drives presence and the poll.
+            if (isCasting) return
             val master = crossfadeEngine?.masterPlayer
             updateDiscordPresence(mediaItem, master?.isPlaying == true)
             if (master?.isPlaying == true) {
@@ -353,6 +387,7 @@ class StashPlaybackService : MediaLibraryService() {
             // During a transition the engine owns both players' play/pause state
             // (pauseAtEndOfMediaItems, the spare) — ignore the churn it makes.
             if (crossfadeEngine?.isTransitioning() == true) return
+            if (isCasting) return // the master was stopped for the cast; castListener has this
             val master = crossfadeEngine?.masterPlayer
             updateDiscordPresence(master?.currentMediaItem, isPlaying)
             if (isPlaying && master != null) {
@@ -389,7 +424,8 @@ class StashPlaybackService : MediaLibraryService() {
         }
 
         override fun onTimelineChanged(timeline: Timeline, reason: Int) {
-            val master = crossfadeEngine?.masterPlayer ?: return
+            // While casting, "play" means the speaker: never start the stopped master.
+            val master = activePlayer ?: return
             when (resumePlayGate.onTimelineChanged(
                 timeline.windowCount,
                 master.playbackState == Player.STATE_IDLE,
@@ -497,6 +533,7 @@ class StashPlaybackService : MediaLibraryService() {
             urlCache = streamUrlCache,
             trackDao = trackDao,
         )
+        this.mediaSourceFactory = mediaSourceFactory
 
         // Two-player crossfade engine (role-swap). Both players build with
         // handleAudioFocus = false; the engine manages audio focus manually so
@@ -622,7 +659,154 @@ class StashPlaybackService : MediaLibraryService() {
                 .collect { if (listenTogetherController.active.value) triggerNotificationUpdate() }
         }
 
+        // Google Cast (spec 2026-10-06 §3). Logged at the wiring site.
+        android.util.Log.i("StashPlayback", "cast attached")
+        serviceScope.launch {
+            castDevices.remote.collect { remote -> if (remote != null) enterCast(remote) else exitCast() }
+        }
+
         updateCustomLayout()
+    }
+
+    /** Session-player listener while casting: idleness, the prefetch poll and presence follow the speaker. */
+    private val castListener = object : Player.Listener {
+        override fun onEvents(player: Player, events: Player.Events) {
+            if (!isCasting) return
+            val idle = isPlayerIdle(player.playWhenReady, player.playbackState)
+            castIdleSinceMs = if (idle) castIdleSinceMs ?: android.os.SystemClock.elapsedRealtime() else null
+            playerIdle.value = idle
+            if (events.containsAny(Player.EVENT_IS_PLAYING_CHANGED, Player.EVENT_MEDIA_ITEM_TRANSITION)) {
+                updateDiscordPresence(player.currentMediaItem, player.isPlaying)
+                if (player.isPlaying) {
+                    startPrefetchPoll(player)
+                } else {
+                    prefetchPollJob?.cancel()
+                    prefetchPollJob = null
+                }
+            }
+        }
+    }
+
+    /**
+     * Hands playback to a cast speaker: stops the master where it is (the
+     * queue stays on it), serves its songs over the LAN and puts
+     * [com.stash.core.media.cast.CastSessionPlayer] on the session.
+     */
+    @OptIn(UnstableApi::class)
+    private fun enterCast(remote: com.stash.core.media.cast.CastRemote) {
+        if (isCasting) return
+        val engine = crossfadeEngine ?: return
+        // The two exclude each other (spec §3): Listen Together owns the player for the session.
+        if (listenTogetherController.active.value) {
+            android.util.Log.i("StashPlayback", "cast: refused during Listen Together")
+            castDevices.disconnect()
+            return
+        }
+        val factory = mediaSourceFactory ?: return
+        val server = castServer ?: com.stash.core.media.cast.CastMediaServer(
+            audioSource = { entry -> factory.dataSourceFactoryFor(entry.payload as MediaItem).createDataSource() },
+            artworkSource = { androidx.media3.datasource.DefaultDataSource.Factory(this).createDataSource() },
+        ).also { castServer = it }
+        if (!server.start()) {
+            android.util.Log.w("StashPlayback", "cast: no LAN address, disconnecting")
+            android.widget.Toast.makeText(this, R.string.cast_no_wifi, android.widget.Toast.LENGTH_LONG).show()
+            castDevices.disconnect()
+            return
+        }
+        setCrossfadeSuspended(true)
+        val master = engine.masterPlayer
+        val positionMs = master.currentPosition
+        val playWhenReady = master.playWhenReady
+        master.playWhenReady = false
+        master.stop() // keeps the queue and position; nothing plays or buffers on the phone
+        val wrapper = castPlayer ?: com.stash.core.media.cast.CastSessionPlayer(master, ::castMediaFor)
+            .also { castPlayer = it }
+        wrapper.attach(master, remote, positionMs, playWhenReady)
+        wrapper.addListener(castListener)
+        mediaSession?.player = wrapper
+        acquireCastLocks()
+        val idle = isPlayerIdle(wrapper.playWhenReady, wrapper.playbackState)
+        castIdleSinceMs = if (idle) android.os.SystemClock.elapsedRealtime() else null
+        playerIdle.value = idle
+        android.util.Log.i("StashPlayback", "cast: playing on the speaker from ${positionMs}ms")
+        updateCustomLayout()
+        triggerNotificationUpdate()
+    }
+
+    /**
+     * Takes playback back from the speaker: the master gets the session and
+     * the speaker's position, paused. Stopping a cast must never start the
+     * phone's loudspeaker. Idempotent.
+     */
+    @OptIn(UnstableApi::class)
+    private fun exitCast() {
+        val wrapper = castPlayer?.takeIf { it.isAttached } ?: return
+        val handoff = wrapper.detach()
+        wrapper.removeListener(castListener)
+        castServer?.stop()
+        releaseCastLocks()
+        castIdleSinceMs = null
+        val master = crossfadeEngine?.masterPlayer
+        if (master != null) {
+            mediaSession?.player = master
+            if (handoff.mediaItemIndex in 0 until master.mediaItemCount) {
+                master.seekTo(handoff.mediaItemIndex, handoff.positionMs)
+            }
+            master.playWhenReady = false
+            if (master.mediaItemCount > 0) master.prepare()
+        }
+        setCrossfadeSuspended(false)
+        refreshPlayerIdle()
+        android.util.Log.i("StashPlayback", "cast: back on the phone at ${handoff.positionMs}ms")
+        updateCustomLayout()
+        triggerNotificationUpdate()
+    }
+
+    /** What the speaker loads for [item]: a LAN URL from [castServer], plus the metadata it shows. */
+    private fun castMediaFor(item: MediaItem, contentId: String): com.stash.core.media.cast.CastMedia? {
+        val server = castServer ?: return null
+        val uri = item.localConfiguration?.uri ?: return null
+        val url = server.audioUrl(uri, item) ?: return null
+        val metadata = item.mediaMetadata
+        val extras = metadata.extras
+        return com.stash.core.media.cast.CastMedia(
+            contentId = contentId,
+            url = url,
+            contentType = castContentType(uri, extras?.getString(EXTRA_STREAM_CODEC)),
+            title = metadata.title?.toString(),
+            artist = metadata.artist?.toString(),
+            album = metadata.albumTitle?.toString(),
+            artworkUrl = server.artworkUrl(metadata.artworkUri),
+            durationMs = extras?.getLong(EXTRA_TRACK_DURATION_MS, 0L) ?: 0L,
+        )
+    }
+
+    /** The phone serves audio while the screen is off, so the CPU and Wi-Fi must stay awake. */
+    private fun acquireCastLocks() {
+        if (castWakeLock == null) {
+            castWakeLock = getSystemService(android.os.PowerManager::class.java)
+                .newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "Stash:cast")
+                .apply { setReferenceCounted(false); acquire() }
+        }
+        if (castWifiLock == null) {
+            // The same lock media3 takes for WAKE_MODE_NETWORK. Since Android 14
+            // the platform turns it into a LOW_LATENCY lock, which only holds
+            // while the app is in the foreground with the screen on, so with the
+            // screen off Wi-Fi may enter power save: slower replies to the
+            // speaker, but the connection stays. There is no stronger lock to
+            // ask for; the partial wake lock keeps the server itself running.
+            @Suppress("DEPRECATION")
+            castWifiLock = applicationContext.getSystemService(android.net.wifi.WifiManager::class.java)
+                ?.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "Stash:cast")
+                ?.apply { setReferenceCounted(false); acquire() }
+        }
+    }
+
+    private fun releaseCastLocks() {
+        castWakeLock?.takeIf { it.isHeld }?.release()
+        castWakeLock = null
+        castWifiLock?.takeIf { it.isHeld }?.release()
+        castWifiLock = null
     }
 
     /**
@@ -888,7 +1072,7 @@ class StashPlaybackService : MediaLibraryService() {
      */
     private fun refreshPlayerIdle() {
         if (crossfadeEngine?.isTransitioning() == true) return
-        val master = crossfadeEngine?.masterPlayer ?: return
+        val master = activePlayer ?: return
         playerIdle.value = isPlayerIdle(master.playWhenReady, master.playbackState)
     }
 
@@ -908,10 +1092,16 @@ class StashPlaybackService : MediaLibraryService() {
     private fun performIdleStop() {
         // A paused listener, or a host in a long pause, must not drop out of the session (spec §5).
         if (listenTogetherController.active.value) return
-        val master = crossfadeEngine?.masterPlayer
+        val master = activePlayer
         if (master != null && !isPlayerIdle(master.playWhenReady, master.playbackState)) {
             // Belt and braces: the ticker's view lagged reality somehow.
             return
+        }
+        // A paused speaker gets CAST_IDLE_STOP_TIMEOUT_MS; the ticker keeps
+        // re-firing every IDLE_STOP_TIMEOUT_MS until then.
+        if (isCasting) {
+            val idleFor = android.os.SystemClock.elapsedRealtime() - (castIdleSinceMs ?: return)
+            if (idleFor < CAST_IDLE_STOP_TIMEOUT_MS) return
         }
         android.util.Log.i(
             "StashPlayback",
@@ -1036,7 +1226,7 @@ class StashPlaybackService : MediaLibraryService() {
         val artScheme = metadata?.artworkUri?.scheme?.lowercase()
         val artUrl = metadata?.artworkUri?.toString()
             ?.takeIf { artScheme == "http" || artScheme == "https" }
-        val master = crossfadeEngine?.masterPlayer
+        val master = activePlayer
         val positionMs = master?.currentPosition ?: 0L
         val durationMs = master?.duration?.takeIf { it > 0 } ?: 0L
         discordRpcCoordinator.updateNowPlaying(title, artist, album, artUrl, positionMs, durationMs, isPlaying)
@@ -1247,6 +1437,10 @@ class StashPlaybackService : MediaLibraryService() {
         cancelSleepTimerNotification()
         listenedPlayer?.removeListener(playerListener)
         listenedPlayer = null
+        // The speaker would play out its one song and stop; end the cast cleanly instead.
+        if (isCasting) castDevices.disconnect()
+        castServer?.stop()
+        releaseCastLocks()
         serviceScope.cancel()
         // Release the session before the players; the engine owns BOTH players.
         mediaSession?.release()
@@ -1354,6 +1548,11 @@ class StashPlaybackService : MediaLibraryService() {
         }
 
         override fun enterSession(isHost: Boolean, interceptor: com.stash.core.media.listen.SessionInterceptor) {
+            // Cast and Listen Together exclude each other (cast spec §3): the session takes the player back first.
+            if (isCasting) {
+                exitCast()
+                castDevices.disconnect()
+            }
             setCrossfadeSuspended(true)
             val m = master
             // The session player holds one song, and the room decides what comes next (spec §4).
@@ -2123,6 +2322,23 @@ class StashPlaybackService : MediaLibraryService() {
  * errored-out player (IDLE) both leave `playWhenReady` true forever, and were
  * exactly the "service alive 1h15m after last play" measurement.
  */
+/**
+ * The MIME type a cast receiver is told to expect. Only a hint — the media
+ * server sniffs the real type from the bytes — but the Default Media Receiver
+ * needs one to pick its player. Codec extra (streams) first, then extension.
+ */
+internal fun castContentType(uri: android.net.Uri, codec: String?): String {
+    val hint = codec?.lowercase() ?: uri.lastPathSegment?.substringAfterLast('.', "")?.lowercase()
+    return when (hint) {
+        "flac" -> "audio/flac"
+        "m4a", "mp4", "aac", "alac" -> "audio/mp4"
+        "opus", "ogg", "oga", "vorbis" -> "audio/ogg"
+        "webm", "weba" -> "audio/webm"
+        "wav" -> "audio/wav"
+        else -> "audio/mpeg"
+    }
+}
+
 internal fun isPlayerIdle(playWhenReady: Boolean, playbackState: Int): Boolean =
     !playWhenReady ||
         playbackState == Player.STATE_ENDED ||
