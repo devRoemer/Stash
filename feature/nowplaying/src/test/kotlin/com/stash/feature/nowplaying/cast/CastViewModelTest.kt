@@ -28,6 +28,8 @@ class CastViewModelTest {
         val volumes = mutableListOf<Float>()
         val listeners = mutableListOf<() -> Unit>()
         override fun load(media: CastMedia, startPositionMs: Long, autoplay: Boolean) = Unit
+        override fun setNext(media: CastMedia?) = Unit
+        override fun playNext() = false
         override fun play() = Unit
         override fun pause() = Unit
         override fun seekTo(positionMs: Long) = Unit

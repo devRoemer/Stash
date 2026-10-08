@@ -26,6 +26,10 @@ import kotlin.math.roundToInt
  * current song: play/pause, seeks within the song, position, duration, errors
  * and volume go to and come from [CastRemote]. When the current song changes —
  * a skip, a queue edit, the speaker finishing — the new one is loaded there.
+ * Once a song plays, the next one is queued on the speaker ([CastRemote.setNext])
+ * so it moves on without a gap; when it does, the local queue follows.
+ * Every song is [prepare]d before the speaker sees it, so a stream that still
+ * has to be resolved never keeps the speaker's request waiting.
  *
  * Every controller (Now Playing via PlayerRepositoryImpl, the notification,
  * the lock screen, Bluetooth, Android Auto) reaches the speaker through here,
@@ -42,6 +46,12 @@ class CastSessionPlayer(
     local: Player,
     /** Builds what the speaker loads for an item, or null when it can't be served. */
     private val mediaFor: (item: MediaItem, contentId: String) -> CastMedia?,
+    /**
+     * Gets [item]'s bytes ready to serve (resolves a stream that hasn't been
+     * yet), then calls back on the main thread: true when it can be served.
+     * Immediate for local files.
+     */
+    private val prepare: (item: MediaItem, done: (Boolean) -> Unit) -> Unit = { _, done -> done(true) },
     private val clock: () -> Long = SystemClock::elapsedRealtime,
 ) : ForwardingSimpleBasePlayer(local) {
 
@@ -66,6 +76,14 @@ class CastSessionPlayer(
     /** The contentId whose FINISHED we already acted on — status repeats it until the next load. */
     private var finishedContentId: String? = null
 
+    /** The song queued on the speaker after the current one, and where it sits in the local queue. */
+    private data class Queued(val contentId: String, val mediaId: String, val index: Int)
+    private var queued: Queued? = null
+
+    /** Bumped whenever a queued-next request goes stale, so its late prepare callback is dropped. */
+    private var nextRequest = 0
+    private var nextCounter = 0
+
     /** The queue ran out on the speaker (no next item, repeat off). */
     private var ended = false
     private var error: PlaybackException? = null
@@ -78,8 +96,19 @@ class CastSessionPlayer(
     private val remoteListener: () -> Unit = { onRemoteStatus() }
 
     private val localListener = object : Player.Listener {
-        override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) = reconcile()
-        override fun onTimelineChanged(timeline: Timeline, reason: Int) = reconcile()
+        override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+            reconcile()
+            scheduleNext()
+        }
+
+        override fun onTimelineChanged(timeline: Timeline, reason: Int) {
+            reconcile()
+            scheduleNext()
+        }
+
+        // Both change which song comes next.
+        override fun onRepeatModeChanged(repeatMode: Int) = scheduleNext()
+        override fun onShuffleModeEnabledChanged(shuffleModeEnabled: Boolean) = scheduleNext()
     }
 
     val isAttached: Boolean get() = remote != null
@@ -100,7 +129,7 @@ class CastSessionPlayer(
         lastPositionMs = positionMs.coerceAtLeast(0)
         remote.addListener(remoteListener)
         local.addListener(localListener)
-        if (local.currentMediaItem != null) load(lastPositionMs, wantPlay) else invalidateState()
+        if (local.currentMediaItem != null) load(lastPositionMs) else invalidateState()
     }
 
     /**
@@ -121,6 +150,7 @@ class CastSessionPlayer(
         loadedContentId = null
         syncedContentId = null
         finishedContentId = null
+        dropQueued()
         invalidateState()
         return handoff
     }
@@ -132,10 +162,15 @@ class CastSessionPlayer(
 
     // ── Loading ─────────────────────────────────────────────────────────
 
-    /** Loads the local player's current item on the speaker. */
-    private fun load(positionMs: Long, autoplay: Boolean) {
+    /**
+     * Loads the local player's current item on the speaker, once [prepare] has
+     * it ready. Until then the speaker isn't asked; the player reports
+     * buffering. A newer load, or the speaker going away, drops this one.
+     */
+    private fun load(positionMs: Long) {
         val target = remote ?: return
         val item = player.currentMediaItem
+        dropQueued() // a load replaces the receiver's whole queue
         if (item == null) {
             target.stop()
             loadedMediaId = null
@@ -150,19 +185,80 @@ class CastSessionPlayer(
         remoteDurationMs = 0L
         lastPositionMs = positionMs.coerceAtLeast(0)
         ended = false
-        val media = mediaFor(item, contentId)
+        error = null
+        prepare(item) { ready ->
+            if (remote === target && loadedContentId == contentId) send(target, item, contentId, ready)
+        }
+        invalidateState()
+    }
+
+    private fun send(target: CastRemote, item: MediaItem, contentId: String, ready: Boolean) {
+        val media = if (ready) mediaFor(item, contentId) else null
         if (media == null) {
-            error = PlaybackException(
-                "This song can't be sent to the speaker",
-                null,
-                PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND,
-            )
+            error = if (ready) {
+                PlaybackException("This song can't be sent to the speaker", null, PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND)
+            } else {
+                PlaybackException("This song couldn't be loaded for the speaker", null, PlaybackException.ERROR_CODE_IO_UNSPECIFIED)
+            }
         } else {
-            error = null
-            target.load(media, lastPositionMs, autoplay)
+            // wantPlay as it is now: a pause may have arrived while the song was prepared.
+            target.load(media, lastPositionMs, wantPlay)
             lastCommandAtMs = clock()
         }
         invalidateState()
+    }
+
+    /**
+     * Queues the song after the current one on the speaker, or takes a queued
+     * one back when the queue, shuffle or repeat changed what comes next. Only
+     * while the current song is playing there: a load in flight replaces the
+     * receiver's queue anyway. Repeat-one queues nothing; FINISHED restarts it.
+     */
+    private fun scheduleNext() {
+        val target = remote ?: return
+        if (loadedContentId == null || syncedContentId != loadedContentId || ended || error != null) return
+        val local = player
+        val nextIndex = if (local.repeatMode == Player.REPEAT_MODE_ONE) C.INDEX_UNSET else local.nextMediaItemIndex
+        val item = nextIndex.takeIf { it != C.INDEX_UNSET }?.let { runCatching { local.getMediaItemAt(it) }.getOrNull() }
+        val current = queued
+        if (item != null && current != null && current.mediaId == item.mediaId && current.index == nextIndex) return
+        if (current != null) target.setNext(null)
+        dropQueued()
+        if (item == null) return
+        val request = nextRequest
+        val contentId = "${item.mediaId}#n${++nextCounter}"
+        prepare(item) { ready ->
+            if (remote !== target || request != nextRequest || !ready) return@prepare
+            val media = mediaFor(item, contentId) ?: return@prepare
+            queued = Queued(contentId, item.mediaId, nextIndex)
+            target.setNext(media)
+        }
+    }
+
+    private fun dropQueued() {
+        queued = null
+        nextRequest++
+    }
+
+    /**
+     * The speaker moved on to the song we queued: that is the current song now.
+     * The local queue follows without a reload — reconcile sees the same mediaId.
+     */
+    private fun onSpeakerAdvanced(next: Queued) {
+        queued = null
+        loadedMediaId = next.mediaId
+        loadedContentId = next.contentId
+        syncedContentId = null
+        finishedContentId = null
+        remoteDurationMs = 0L
+        lastPositionMs = 0L
+        ended = false
+        error = null
+        val local = player
+        val index = next.index.takeIf {
+            it < local.mediaItemCount && runCatching { local.getMediaItemAt(it).mediaId }.getOrNull() == next.mediaId
+        } ?: local.nextMediaItemIndex
+        if (index != C.INDEX_UNSET) local.seekTo(index, 0L)
     }
 
     /** The local current item changed under us (skip, queue edit): follow it on the speaker. */
@@ -170,20 +266,20 @@ class CastSessionPlayer(
         if (remote == null) return
         val item = player.currentMediaItem
         if (item == null) {
-            if (loadedMediaId != null) load(0L, autoplay = false)
+            if (loadedMediaId != null) load(0L)
             return
         }
         // Same song (the prefetch swaps a placeholder for a resolved URL in
         // place; a queue edit elsewhere shifts the index): leave it playing.
         if (item.mediaId == loadedMediaId) return
-        load(player.currentPosition.coerceAtLeast(0), wantPlay)
+        load(player.currentPosition.coerceAtLeast(0))
     }
 
     /** The speaker finished a song: move the local queue on, the way ExoPlayer would. */
     private fun advance() {
         val local = player
         if (local.repeatMode == Player.REPEAT_MODE_ONE) {
-            load(0L, autoplay = true)
+            load(0L)
             return
         }
         val next = local.nextMediaItemIndex
@@ -206,11 +302,20 @@ class CastSessionPlayer(
     private fun seekLocalAndLoad(index: Int, positionMs: Long) {
         val before = loadCounter
         player.seekTo(index, positionMs)
-        if (loadCounter == before) load(positionMs, wantPlay)
+        if (loadCounter == before) load(positionMs)
     }
 
     private fun onRemoteStatus() {
         val status = remote?.status ?: return
+        queued?.let { if (status.contentId == it.contentId) onSpeakerAdvanced(it) }
+        if (playsSomethingElse(status)) {
+            // The speaker went on to a song we no longer meant to queue (one
+            // left behind in its queue). Our song is over there, so move on the
+            // way a finished song does, which loads what the phone has next.
+            finishedContentId = loadedContentId
+            advance()
+            return
+        }
         if (status.contentId != null && status.contentId == loadedContentId) {
             lastPositionMs = status.positionMs
             if (status.durationMs > 0) remoteDurationMs = status.durationMs
@@ -223,6 +328,7 @@ class CastSessionPlayer(
                     remote?.let { if (wantPlay) it.play() else it.pause() }
                     lastCommandAtMs = clock()
                 }
+                scheduleNext()
                 invalidateState()
                 return
             }
@@ -256,6 +362,19 @@ class CastSessionPlayer(
             }
         }
         invalidateState()
+    }
+
+    /**
+     * True when the speaker plays a song that is neither ours nor queued, after
+     * ours had started there. During our own load the previous song can still be
+     * reported for a moment; that load isn't synced yet, so it doesn't count.
+     */
+    private fun playsSomethingElse(status: CastStatus): Boolean {
+        val id = status.contentId ?: return false
+        if (id == loadedContentId || id == queued?.contentId) return false
+        if (loadedContentId == null || syncedContentId != loadedContentId || ended || error != null) return false
+        return status.playerState == CastStatus.PlayerState.PLAYING ||
+            status.playerState == CastStatus.PlayerState.BUFFERING
     }
 
     private fun currentPositionMs(): Long {
@@ -358,7 +477,7 @@ class CastSessionPlayer(
                 lastCommandAtMs = clock()
             }
             // Nothing on the speaker (stopped, failed, or never loaded): play loads it.
-            playWhenReady && !ended && player.currentMediaItem != null -> load(lastPositionMs, autoplay = true)
+            playWhenReady && !ended && player.currentMediaItem != null -> load(lastPositionMs)
         }
         invalidateState()
         return DONE
@@ -367,7 +486,7 @@ class CastSessionPlayer(
     /** The local player must never prepare while casting; prepare means "load it on the speaker" here. */
     override fun handlePrepare(): ListenableFuture<*> {
         if (remote == null) return super.handlePrepare()
-        if (loadedContentId == null || error != null) load(lastPositionMs, wantPlay)
+        if (loadedContentId == null || error != null) load(lastPositionMs)
         return DONE
     }
 
@@ -377,6 +496,7 @@ class CastSessionPlayer(
         lastPositionMs = currentPositionMs()
         loadedMediaId = null
         loadedContentId = null
+        dropQueued()
         invalidateState()
         return DONE
     }
@@ -395,8 +515,20 @@ class CastSessionPlayer(
                 lastPositionMs = position
             } else {
                 // Finished, failed or stopped: seeking starts it again from there.
-                load(position, wantPlay)
+                load(position)
             }
+            invalidateState()
+            return DONE
+        }
+        // The song already queued on the speaker (the usual "next"): it is
+        // buffered there, so jumping to it starts at once, where a fresh load
+        // would fetch it again from the start.
+        val next = queued
+        if (next != null && mediaItemIndex == next.index && position == 0L && !ended && error == null &&
+            target.playNext()
+        ) {
+            lastCommandAtMs = clock()
+            onSpeakerAdvanced(next)
             invalidateState()
             return DONE
         }

@@ -118,6 +118,7 @@ class StashPlaybackService : MediaLibraryService() {
 
     /** Google Cast (spec 2026-10-06). */
     @Inject lateinit var castDevices: com.stash.core.media.cast.CastDevices
+    @Inject lateinit var playbackDiagnosticsLog: com.stash.core.media.diagnostics.PlaybackDiagnosticsLog
 
     companion object {
         /** Custom command action for toggling shuffle mode. */
@@ -452,12 +453,12 @@ class StashPlaybackService : MediaLibraryService() {
                 return listOfNotNull(togetherLine(listenTogetherController.state.value), base).joinToString(" · ")
             }
         }
-        // Listen Together keeps the service in the foreground while paused (onUpdateNotification below), but
+        // Listen Together and casting keep the service in the foreground while paused (onUpdateNotification below), but
         // Media3's MediaNotificationManager.onNotificationUpdated, which runs when artwork finishes loading in the
         // background, calls shouldRunInForeground(false) past that override. After Media3's 10-minute pause
         // timeout that drops a paused listener to background, and on Android 12+ the cached process freezes and
-        // loses the room's WebSocket. So during a session the artwork callback asks for a full update instead,
-        // which goes through onUpdateNotification.
+        // loses the room's WebSocket (casting: the media server and the speaker connection). So during a session
+        // or a cast the artwork callback asks for a full update instead, which goes through onUpdateNotification.
         // Recursion: triggerNotificationUpdate runs createNotification inline on main (Util.postOrRun), and the
         // artwork callback is always posted (Futures.addCallback on the session's handler). The round we start
         // ourselves normally finds the artwork cached (no callback); if one still arrives it is dropped, so the
@@ -473,7 +474,7 @@ class StashPlaybackService : MediaLibraryService() {
                 val fromRedirect = redirectingArtwork
                 return baseProvider.createNotification(mediaSession, mediaButtonPreferences, actionFactory) { n ->
                     when {
-                        !listenTogetherController.active.value -> onNotificationChangedCallback.onNotificationChanged(n)
+                        !listenTogetherController.active.value && !isCasting -> onNotificationChangedCallback.onNotificationChanged(n)
                         fromRedirect -> Unit
                         else -> {
                             redirectingArtwork = true
@@ -672,6 +673,9 @@ class StashPlaybackService : MediaLibraryService() {
     private val castListener = object : Player.Listener {
         override fun onEvents(player: Player, events: Player.Events) {
             if (!isCasting) return
+            if (events.contains(Player.EVENT_PLAYER_ERROR)) {
+                player.playerError?.let { playbackDiagnosticsLog.recordCast("speaker error: ${it.errorCodeName}") }
+            }
             val idle = isPlayerIdle(player.playWhenReady, player.playbackState)
             castIdleSinceMs = if (idle) castIdleSinceMs ?: android.os.SystemClock.elapsedRealtime() else null
             playerIdle.value = idle
@@ -706,6 +710,7 @@ class StashPlaybackService : MediaLibraryService() {
         val server = castServer ?: com.stash.core.media.cast.CastMediaServer(
             audioSource = { entry -> factory.dataSourceFactoryFor(entry.payload as MediaItem).createDataSource() },
             artworkSource = { androidx.media3.datasource.DefaultDataSource.Factory(this).createDataSource() },
+            onEvent = playbackDiagnosticsLog::recordCast,
         ).also { castServer = it }
         if (!server.start()) {
             android.util.Log.w("StashPlayback", "cast: no LAN address, disconnecting")
@@ -719,7 +724,7 @@ class StashPlaybackService : MediaLibraryService() {
         val playWhenReady = master.playWhenReady
         master.playWhenReady = false
         master.stop() // keeps the queue and position; nothing plays or buffers on the phone
-        val wrapper = castPlayer ?: com.stash.core.media.cast.CastSessionPlayer(master, ::castMediaFor)
+        val wrapper = castPlayer ?: com.stash.core.media.cast.CastSessionPlayer(master, ::castMediaFor, ::prepareForCast)
             .also { castPlayer = it }
         wrapper.attach(master, remote, positionMs, playWhenReady)
         wrapper.addListener(castListener)
@@ -729,6 +734,7 @@ class StashPlaybackService : MediaLibraryService() {
         castIdleSinceMs = if (idle) android.os.SystemClock.elapsedRealtime() else null
         playerIdle.value = idle
         android.util.Log.i("StashPlayback", "cast: playing on the speaker from ${positionMs}ms")
+        playbackDiagnosticsLog.recordCast("playback moved to the speaker")
         updateCustomLayout()
         triggerNotificationUpdate()
     }
@@ -758,6 +764,7 @@ class StashPlaybackService : MediaLibraryService() {
         setCrossfadeSuspended(false)
         refreshPlayerIdle()
         android.util.Log.i("StashPlayback", "cast: back on the phone at ${handoff.positionMs}ms")
+        playbackDiagnosticsLog.recordCast("playback back on the phone")
         updateCustomLayout()
         triggerNotificationUpdate()
     }
@@ -765,6 +772,7 @@ class StashPlaybackService : MediaLibraryService() {
     /** What the speaker loads for [item]: a LAN URL from [castServer], plus the metadata it shows. */
     private fun castMediaFor(item: MediaItem, contentId: String): com.stash.core.media.cast.CastMedia? {
         val server = castServer ?: return null
+        if (!server.ensureCurrentAddress()) return null // cast spec §4: follow a changed LAN address
         val uri = item.localConfiguration?.uri ?: return null
         val url = server.audioUrl(uri, item) ?: return null
         val metadata = item.mediaMetadata
@@ -779,6 +787,51 @@ class StashPlaybackService : MediaLibraryService() {
             artworkUrl = server.artworkUrl(metadata.artworkUri),
             durationMs = extras?.getLong(EXTRA_TRACK_DURATION_MS, 0L) ?: 0L,
         )
+    }
+
+    /**
+     * Gets [item] ready before the speaker asks for it (cast spec §4), doing
+     * only what saves the speaker a wait or a failure:
+     *  - a stream that still has to be resolved (a stash-resolve placeholder
+     *    with no cached URL: lossless lookup, maybe yt-dlp for up to 45 s) is
+     *    resolved here, by opening its first byte through the same routing,
+     *    which fills the URL cache. Otherwise the speaker's own request would
+     *    wait on the resolve, and the speaker can give up first.
+     *  - a content:// file is opened once, so one whose folder access is gone
+     *    fails here, before the speaker is asked for it. Local, so cheap.
+     * Everything else (file://, a resolved or cached stream) is ready as it
+     * is: a test open would only add a network round trip to every song start.
+     */
+    private fun prepareForCast(item: MediaItem, done: (Boolean) -> Unit) {
+        val uri = item.localConfiguration?.uri
+        val scheme = uri?.scheme?.lowercase()
+        val factory = mediaSourceFactory
+        val needsOpen = when (scheme) {
+            "content" -> true
+            com.stash.core.media.streaming.STASH_RESOLVE_SCHEME ->
+                uri.lastPathSegment?.toLongOrNull()?.let { streamUrlCache.get(it) } == null
+            else -> false
+        }
+        if (uri == null || factory == null || !needsOpen) {
+            done(true)
+            return
+        }
+        serviceScope.launch {
+            val ready = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                val source = factory.dataSourceFactoryFor(item).createDataSource()
+                try {
+                    source.open(androidx.media3.datasource.DataSpec.Builder().setUri(uri).setLength(1).build())
+                    true
+                } catch (e: Exception) { // IOException, or SecurityException for a content:// file
+                    android.util.Log.w("StashPlayback", "cast: couldn't prepare a $scheme song: ${e.message}")
+                    false
+                } finally {
+                    runCatching { source.close() }
+                }
+            }
+            if (!ready) playbackDiagnosticsLog.recordCast("song prepare failed: $scheme")
+            done(ready)
+        }
     }
 
     /** The phone serves audio while the screen is off, so the CPU and Wi-Fi must stay awake. */
@@ -1399,7 +1452,8 @@ class StashPlaybackService : MediaLibraryService() {
     }
 
     /**
-     * During a session the notification stays in the foreground even while paused (spec §5). The ceiling: Android 16
+     * During a session, or while casting, the notification stays in the foreground even while paused (spec §5;
+     * cast spec §3: a frozen process can't serve the speaker its next song). The ceiling: Android 16
      * still demotes a media service paused for 10 minutes (system `setFgsInactiveLocked`; device test 2026-09-25)
      * and Media3 can't restart it from the background, so a long pause holds only while the process lives. Play from
      * the notification or a media button is exempt and brings the foreground back.
@@ -1407,7 +1461,7 @@ class StashPlaybackService : MediaLibraryService() {
     @OptIn(UnstableApi::class)
     override fun onUpdateNotification(session: MediaSession, startInForegroundRequired: Boolean) {
         val inSession = ::listenTogetherController.isInitialized && listenTogetherController.active.value
-        super.onUpdateNotification(session, startInForegroundRequired || inSession)
+        super.onUpdateNotification(session, startInForegroundRequired || inSession || isCasting)
     }
 
     @OptIn(UnstableApi::class)

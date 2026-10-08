@@ -43,7 +43,24 @@ sealed interface CastConnection {
 interface CastRemote {
     val status: CastStatus
 
+    /** Plays [media] now, replacing whatever the receiver held, including a song [setNext] queued. */
     fun load(media: CastMedia, startPositionMs: Long, autoplay: Boolean)
+
+    /**
+     * Queues [media] to play right after the current song, so the receiver
+     * buffers it ahead and moves on without a gap (spec §3). Replaces any song
+     * queued before; null just clears it. When the receiver moves on, its
+     * status reports [media]'s contentId.
+     */
+    fun setNext(media: CastMedia?)
+
+    /**
+     * Jumps to the song [setNext] queued, which the receiver has already
+     * buffered. False when nothing is queued after all (queueing failed, or
+     * the receiver already moved on): the caller loads the song instead.
+     */
+    fun playNext(): Boolean
+
     fun play()
     fun pause()
     fun seekTo(positionMs: Long)

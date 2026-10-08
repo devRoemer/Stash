@@ -48,6 +48,8 @@ class CastMediaServer(
     private val artworkSource: () -> DataSource,
     /** Where to listen. The phone's LAN address; tests use loopback. */
     private val bindAddress: () -> InetAddress? = ::lanAddress,
+    /** Notes for the diagnostics bundle: fixed words, never an address. */
+    private val onEvent: (String) -> Unit = {},
 ) {
     /** What one URL serves. [key] is opaque to callers; [payload] lets [audioSource] route the read. */
     class Entry internal constructor(val uri: Uri, val payload: Any?, internal val isArtwork: Boolean) {
@@ -63,7 +65,14 @@ class CastMediaServer(
     private val order = ArrayDeque<String>()
     private val nextKey = AtomicLong()
 
+    /** The key each file is already served under, so asking again reuses it instead of adding one. */
+    private val keysByFile = HashMap<String, String>()
+
+    /** Connections being served, so [stop] can end them instead of leaving them to fail on their own. */
+    private val clients: MutableSet<Socket> = ConcurrentHashMap.newKeySet()
+
     @Volatile private var serverSocket: ServerSocket? = null
+    @Volatile private var boundAddress: InetAddress? = null
     private var workers: ExecutorService? = null
     private var baseUrl: String? = null
 
@@ -79,35 +88,65 @@ class CastMediaServer(
         if (serverSocket != null) return true
         val address = bindAddress() ?: run {
             Log.w(TAG, "no LAN address — can't serve a cast speaker")
+            onEvent("server: no LAN address")
             return false
         }
         val socket = try {
             ServerSocket(0, BACKLOG, address)
         } catch (e: IOException) {
             Log.w(TAG, "bind failed on ${address.hostAddress}", e)
+            onEvent("server: bind failed")
             return false
         }
         serverSocket = socket
+        boundAddress = address
         baseUrl = "http://${address.hostAddress}:${socket.localPort}/$token"
-        val pool = Executors.newFixedThreadPool(MAX_CONNECTIONS) { r ->
+        // Unbounded, not fixed: a speaker switched off mid-song leaves its
+        // connection's thread stuck in a write (no timeout covers writes) until
+        // TCP gives up, minutes later. A fixed pool would run out of threads and
+        // stop answering. Threads are cheap, idle ones exit after a minute, and
+        // only the speaker's own few connections ever get past the token check.
+        val pool = Executors.newCachedThreadPool { r ->
             Thread(r, "cast-media-server").apply { isDaemon = true }
         }
         workers = pool
         Thread({ acceptLoop(socket, pool) }, "cast-media-accept").apply { isDaemon = true }.start()
         Log.i(TAG, "serving on ${address.hostAddress}:${socket.localPort}")
+        onEvent("server: started")
         return true
+    }
+
+    /**
+     * Called before each song goes to the speaker. When the phone's LAN address
+     * changed since [start] (a new DHCP lease, another network), the server
+     * moves to the new one, so the songs after a reconnect point somewhere
+     * live. The song that was playing can't be saved: the speaker holds its old
+     * URL. False when there's no LAN address now.
+     */
+    @Synchronized
+    fun ensureCurrentAddress(): Boolean {
+        val current = bindAddress() ?: return false
+        if (serverSocket != null && current == boundAddress) return true
+        Log.i(TAG, "LAN address changed — moving the server")
+        onEvent("server: LAN address changed, restarting")
+        stop()
+        return start()
     }
 
     @Synchronized
     fun stop() {
         serverSocket?.let { runCatching { it.close() } }
         serverSocket = null
+        boundAddress = null
         workers?.shutdownNow()
         workers = null
+        clients.forEach { runCatching { it.close() } }
+        clients.clear()
         baseUrl = null
         synchronized(order) {
             entries.clear()
             order.clear()
+            keysByFile.clear()
         }
     }
 
@@ -132,13 +171,29 @@ class CastMediaServer(
 
     private fun register(entry: Entry, kind: String): String? {
         val base = baseUrl ?: return null
-        val key = nextKey.incrementAndGet().toString()
-        synchronized(order) {
+        val file = "$kind ${entry.uri}"
+        val key = synchronized(order) {
+            // The same file asked for again (a re-queued next song, a reload, its
+            // cover) keeps its URL. Only the payload is refreshed: a stream's item
+            // may since carry its resolved origin. What the first read learned
+            // about the file stays.
+            val key = keysByFile[file] ?: nextKey.incrementAndGet().toString()
+            entries[key]?.let { old ->
+                entry.sniffedType = old.sniffedType
+                entry.totalLength = old.totalLength
+            }
             entries[key] = entry
+            keysByFile[file] = key
+            order.remove(key)
             order.addLast(key)
-            // The speaker only ever needs the current song and its cover; a
-            // few spares cover a quick skip-back while an old request drains.
-            while (order.size > MAX_ENTRIES) entries.remove(order.removeFirst())
+            // The speaker needs the current song, the queued one and their covers.
+            // The rest are spares for a skip back while an old request drains;
+            // the oldest go first.
+            while (order.size > MAX_ENTRIES) {
+                val dropped = order.removeFirst()
+                entries.remove(dropped)?.let { keysByFile.remove("${if (it.isArtwork) "a" else "m"} ${it.uri}") }
+            }
+            key
         }
         return "$base/$kind/$key"
     }
@@ -150,9 +205,17 @@ class CastMediaServer(
             } catch (e: IOException) {
                 break // closed by stop()
             }
+            clients += client
             try {
-                pool.execute { client.use { handle(it) } }
+                pool.execute {
+                    try {
+                        client.use { handle(it) }
+                    } finally {
+                        clients -= client
+                    }
+                }
             } catch (e: java.util.concurrent.RejectedExecutionException) {
+                clients -= client
                 runCatching { client.close() }
             }
         }
@@ -174,6 +237,11 @@ class CastMediaServer(
             // The speaker hung up mid-song (seek, skip, stop). Routine.
         } catch (e: IOException) {
             Log.w(TAG, "serving ${request.path} failed: ${e.message}")
+        } catch (e: RuntimeException) {
+            // Uncaught here it would kill the whole app from this worker thread.
+            Log.w(TAG, "serving ${request.path} failed", e)
+            onEvent("server: request failed (${e.javaClass.simpleName})")
+            runCatching { respondEmpty(out, 500, "Internal Server Error") }
         }
     }
 
@@ -207,9 +275,12 @@ class CastMediaServer(
         val source = if (entry.isArtwork) artworkSource() else audioSource(entry)
         val remaining = try {
             source.open(DataSpec.Builder().setUri(entry.uri).setPosition(start).build())
-        } catch (e: IOException) {
+        } catch (e: Exception) {
+            // IOException, or a SecurityException from a content:// file whose
+            // folder access is gone: the speaker gets a load error, not a crash.
             runCatching { source.close() }
             Log.w(TAG, "open failed for ${entry.uri.scheme}: ${e.message}")
+            if (e !is IOException) onEvent("server: can't read a ${entry.uri.scheme} file (${e.javaClass.simpleName})")
             // 416 for a seek past the end; anything else the speaker sees as a load error.
             val status = if (start > 0 && e is androidx.media3.datasource.DataSourceException &&
                 e.reason == androidx.media3.common.PlaybackException.ERROR_CODE_IO_READ_POSITION_OUT_OF_RANGE
@@ -287,8 +358,7 @@ class CastMediaServer(
     internal companion object {
         private const val TAG = "CastMediaServer"
         private const val BACKLOG = 16
-        private const val MAX_CONNECTIONS = 8
-        private const val MAX_ENTRIES = 12
+        private const val MAX_ENTRIES = 32
         private const val READ_TIMEOUT_MS = 30_000
         private const val BUFFER_SIZE = 64 * 1024
         private const val MAX_HEADER_BYTES = 16 * 1024

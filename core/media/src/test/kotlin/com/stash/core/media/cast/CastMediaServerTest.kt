@@ -170,7 +170,122 @@ class CastMediaServerTest {
         ).isNull()
     }
 
-        @Test fun `range parsing`() {
+        @Test fun `a changed LAN address moves the server, an unchanged one leaves it`() {
+        var address: InetAddress? = InetAddress.getByName("127.0.0.1")
+        val events = mutableListOf<String>()
+        val moving = CastMediaServer(
+            audioSource = { ByteArrayDataSource(song) },
+            artworkSource = { ByteArrayDataSource(song) },
+            bindAddress = { address },
+            onEvent = { events += it },
+        )
+        try {
+            moving.start()
+            val before = moving.audioUrl(Uri.parse("file:///music/a"), payload = null)!!
+            assertThat(moving.ensureCurrentAddress()).isTrue()
+            assertThat(moving.audioUrl(Uri.parse("file:///music/a"), payload = null))
+                .startsWith(before.substringBeforeLast("/m/"))
+
+            address = InetAddress.getByName("127.0.0.2")
+            assertThat(moving.ensureCurrentAddress()).isTrue()
+            val after = moving.audioUrl(Uri.parse("file:///music/a"), payload = null)!!
+            assertThat(Uri.parse(after).host).isEqualTo("127.0.0.2")
+            assertThat(request(after).status).isEqualTo(200)
+            assertThat(events).contains("server: LAN address changed, restarting")
+
+            address = null
+            assertThat(moving.ensureCurrentAddress()).isFalse()
+        } finally {
+            moving.stop()
+        }
+    }
+
+    @Test fun `a file the app may no longer read is a load error, not a crash`() {
+        // Thrown from open(), as ContentDataSource does when the folder grant is gone.
+        val unreadable = object : androidx.media3.datasource.DataSource {
+            override fun open(dataSpec: androidx.media3.datasource.DataSpec): Long =
+                throw SecurityException("Permission Denial: opening provider")
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int = -1
+            override fun getUri(): Uri? = null
+            override fun close() = Unit
+            override fun addTransferListener(transferListener: androidx.media3.datasource.TransferListener) = Unit
+        }
+        val denied = CastMediaServer(
+            audioSource = { unreadable },
+            artworkSource = { ByteArrayDataSource(song) },
+            bindAddress = { InetAddress.getLoopbackAddress() },
+        )
+        try {
+            denied.start()
+            val url = denied.audioUrl(Uri.parse("content://com.android.externalstorage.documents/x"), payload = null)!!
+
+            assertThat(request(url).status).isEqualTo(502)
+        } finally {
+            denied.stop()
+        }
+    }
+
+    @Test fun `any other failure in a request is a 500, not a crash`() {
+        val broken = CastMediaServer(
+            audioSource = { throw IllegalStateException("boom") },
+            artworkSource = { ByteArrayDataSource(song) },
+            bindAddress = { InetAddress.getLoopbackAddress() },
+        )
+        try {
+            broken.start()
+            val url = broken.audioUrl(Uri.parse("file:///music/a"), payload = null)!!
+
+            assertThat(request(url).status).isEqualTo(500)
+        } finally {
+            broken.stop()
+        }
+    }
+
+    @Test fun `the same file keeps its URL, so queue edits can't push the playing song out`() {
+        server.start()
+        val playing = server.audioUrl(Uri.parse("file:///music/a"), payload = null)!!
+        // Far more re-queues than the server keeps entries for: all of b.
+        repeat(100) { server.audioUrl(Uri.parse("file:///music/b"), payload = null) }
+
+        assertThat(server.audioUrl(Uri.parse("file:///music/a"), payload = null)).isEqualTo(playing)
+        assertThat(request(playing).status).isEqualTo(200)
+        assertThat(server.artworkUrl(Uri.parse("file:///music/a"))).isNotEqualTo(playing) // a cover is its own entry
+    }
+
+    @Test fun `stopping ends a transfer that is still running`() {
+        // A source that never ends: a speaker mid-song, fed a little at a time.
+        val endless = object : androidx.media3.datasource.DataSource {
+            override fun open(dataSpec: androidx.media3.datasource.DataSpec): Long = androidx.media3.common.C.LENGTH_UNSET.toLong()
+            override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+                Thread.sleep(5)
+                return minOf(length, 1024)
+            }
+            override fun getUri(): Uri? = null
+            override fun close() = Unit
+            override fun addTransferListener(transferListener: androidx.media3.datasource.TransferListener) = Unit
+        }
+        val streaming = CastMediaServer(
+            audioSource = { endless },
+            artworkSource = { endless },
+            bindAddress = { InetAddress.getLoopbackAddress() },
+        )
+        streaming.start()
+        val url = Uri.parse(streaming.audioUrl(Uri.parse("file:///music/a"), payload = null)!!)
+        Socket(url.host, url.port).use { socket ->
+            socket.soTimeout = 5_000
+            socket.getOutputStream().write("GET ${url.path} HTTP/1.1\r\n\r\n".toByteArray())
+            val input = socket.getInputStream()
+            input.read() // the response has started
+
+            streaming.stop()
+
+            // The server closed the connection: the read ends (EOF or reset), it doesn't time out.
+            val ended = runCatching { while (input.read(ByteArray(64 * 1024)) != -1) Unit }
+            assertThat(ended.exceptionOrNull()).isNotInstanceOf(java.net.SocketTimeoutException::class.java)
+        }
+    }
+
+    @Test fun `range parsing`() {
         assertThat(CastMediaServer.parseRange("bytes=0-")).isEqualTo(0L to null)
         assertThat(CastMediaServer.parseRange("bytes=10-20")).isEqualTo(10L to 20L)
         assertThat(CastMediaServer.parseRange("bytes=20-10")).isNull()

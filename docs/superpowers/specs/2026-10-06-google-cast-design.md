@@ -15,7 +15,7 @@
 | How the speaker gets the audio | Through a small HTTP server on the phone, `CastMediaServer`. It reads through the app's own `DataSource` stack. | Downloaded `file://` and SAF `content://` songs mean nothing to the speaker. Signed stream URLs expire, and the speaker can't refresh them, but our `RefreshingDataSource` / `LazyResolvingDataSource` can. This is the research doc's proxy, built on the stack that already works. |
 | Receiver | The Default Media Receiver (`CC1AD845`) | No custom receiver to host. It plays MP3, AAC/M4A, FLAC, Opus and Vorbis. |
 | Device picker | Our own Compose sheet, built on `MediaRouter` | `MediaRouteButton` needs a `FragmentActivity` and an AppCompat theme, and Stash has neither. |
-| Gaps between songs | Each song is loaded when the one before it ends, so there is a short gap | Accepted for v1. Pre-loading the next song on the receiver is a follow-up. |
+| Gaps between songs | None: once a song plays, the next one is queued on the receiver, which buffers it ahead | The receiver moves on by itself, gapless, and doesn't depend on the phone being awake at the seam. |
 
 ## 2. Modules
 
@@ -38,7 +38,9 @@ Every controller (Now Playing, the notification, the lock screen, Bluetooth, And
 - **Queue, shuffle, repeat and metadata** are forwarded to the local player, which keeps the timeline.
 - **Play, pause, seek within the song, and position** go to the receiver. The current song's duration comes from the receiver once it knows it, and until then from the track's metadata.
 - **When the current song changes** (a skip, a queue edit, a tap in the queue), the new song is loaded on the receiver.
-- **When the receiver finishes a song** (idle with reason `FINISHED`), the wrapper advances the local player using its own `nextMediaItemIndex`, so shuffle and repeat-all just work. With repeat-one it restarts the song.
+- **The next song is queued on the receiver** (`CastRemote.setNext`, with a preload time) as soon as the current one plays. It is chosen by the local player's `nextMediaItemIndex`, so shuffle and repeat-all just work. When the receiver moves on to it, the wrapper moves the local queue along without a reload. A queue edit, or a change to shuffle or repeat, that changes what comes next replaces the queued song. Repeat-one queues nothing.
+- **When the receiver finishes a song with nothing queued** (idle with reason `FINISHED`), the wrapper advances the local player the same way. With repeat-one it restarts the song.
+- **Every song is prepared before the receiver sees it.** A stream that still has to be resolved (a `stash-resolve://` placeholder, possibly yt-dlp for up to 45 s) is opened for its first byte through the same routing, which resolves it and fills the URL cache. Until then the player reports buffering. A skip in the meantime drops the old song, and a pause makes it load paused. If preparing fails, that is a player error, and the repository's guard skips as usual.
 - **When the receiver reports an error,** that becomes the player error. The repository's existing cascade guard then skips, exactly as it does locally.
 - **Device volume** is the receiver's volume. The session reports `PLAYBACK_TYPE_REMOTE`, so the phone's volume keys control the speaker.
 - **Speed** isn't offered while casting.
@@ -66,6 +68,14 @@ The idle-stop countdown and the prefetch poll read the wrapper while casting. Wi
 - **Content-Type.** This comes from the file's first bytes (`fLaC`, `ID3`, MPEG frame sync, `OggS`, `ftyp`, EBML). Speakers trust it more than the file extension.
 - **`HEAD` requests.** Once a read has learned the length and type, a `HEAD` is answered from those, without opening the source again (which could mean a full stream resolve).
 - **Artwork.** `http(s)` artwork goes to the receiver as is. Local cover files go through the server.
+- **Staying responsive.** Asking for the same file again (a re-queued song, its cover) reuses its URL, so queue edits can't push the playing song out of the server's table. Connections run on an unbounded pool of threads: a speaker switched off mid-song leaves its thread stuck in a write until TCP gives up, and a fixed pool would run out. Stopping the server closes the connections still being served.
+- **A changed LAN address.** Before each song goes to the receiver, the server checks the phone's address, and if it changed (a new DHCP lease, after a reconnect) it moves to the new one. The song playing at the time can't be saved, since the receiver holds its old URL, but the songs after it can.
+
+## 4a. Staying alive and diagnosable
+
+- **Foreground while paused.** Casting keeps the service in the foreground while paused, the same way Listen Together does (`onUpdateNotification`, plus the artwork-callback redirect). Otherwise Media3 demotes a paused service after 10 minutes, and on Android 12 and later the frozen process could no longer serve the speaker its next song. The 10-minute ceiling Android 16 imposes on paused media services still applies.
+- **Connecting.** If no session comes up within 20 s, the attempt is cancelled and the speaker selection is released, with a "Couldn't connect" message. A route MediaRouter still holds as selected from an earlier session is released before connecting, because MediaRouter silently ignores selecting it again. The sheet offers Cancel while connecting. A suspended session that doesn't resume within 60 s is ended.
+- **Diagnostics.** The "Playback" section of the diagnostics bundle has a cast block: where casting stands, and the last 15 cast events of this app run. These are connects, timeouts, session start, suspend, resume and end with their codes, server starts and address changes, failed prepares and speaker errors. They are fixed words and numbers only, never a speaker's name or an address.
 
 ## 5. UI
 
@@ -77,7 +87,6 @@ The idle-stop countdown and the prefetch poll read the wrapper while casting. Wi
 
 ## 6. Known limits and follow-ups
 
-- There is a short gap between songs. A follow-up could pre-load the next song with `queueInsertItems`.
 - The phone has to stay on the same Wi-Fi as the speaker. If it changes networks, the speaker stops.
 - Since Android 14, the Wi-Fi lock does nothing while the screen is off: the platform turns it into a low-latency lock, which needs the app in the foreground. Media3's own streaming lock has the same limit. Wi-Fi power save can then slow the server's replies, but the connection stays.
 - Opening casting from the system output switcher, rather than from our button, isn't wired yet.

@@ -119,13 +119,16 @@ internal fun CastSheet(
                         onDismiss()
                     },
                 )
-                is CastConnection.Connecting -> Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.padding(vertical = 12.dp),
-                ) {
-                    CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-                    Spacer(Modifier.width(16.dp))
-                    Text("Connecting to ${state.deviceName}…", style = MaterialTheme.typography.bodyLarge)
+                is CastConnection.Connecting -> {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(vertical = 12.dp),
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(16.dp))
+                        Text("Connecting to ${state.deviceName}…", style = MaterialTheme.typography.bodyLarge)
+                    }
+                    SheetOptionRow(icon = Icons.Default.Close, label = "Cancel", onClick = viewModel::disconnect)
                 }
                 else -> SpeakerList(
                     speakers = speakers,

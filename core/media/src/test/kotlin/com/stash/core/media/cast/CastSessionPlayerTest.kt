@@ -70,6 +70,9 @@ class CastSessionPlayerTest {
         override var status = CastStatus.EMPTY
         val loads = mutableListOf<Triple<String, Long, Boolean>>()
         val calls = mutableListOf<String>()
+
+        /** Every setNext, in order: the queued contentId, or null for "cleared". */
+        val nexts = mutableListOf<String?>()
         private val listeners = mutableListOf<() -> Unit>()
 
         val lastContentId: String get() = loads.last().first
@@ -77,6 +80,10 @@ class CastSessionPlayerTest {
         override fun load(media: CastMedia, startPositionMs: Long, autoplay: Boolean) {
             loads += Triple(media.contentId, startPositionMs, autoplay)
         }
+        override fun setNext(media: CastMedia?) { nexts += media?.contentId }
+        /** What playNext answers: whether the receiver really holds a queued song. */
+        var hasQueued = true
+        override fun playNext(): Boolean { calls += "playNext"; return hasQueued }
         override fun play() { calls += "play" }
         override fun pause() { calls += "pause" }
         override fun seekTo(positionMs: Long) { calls += "seek:$positionMs" }
@@ -100,9 +107,189 @@ class CastSessionPlayerTest {
 
     private var now = 0L
 
-    private fun cast(local: QueuePlayer, remote: FakeRemote, positionMs: Long = 0L, play: Boolean = true) =
-        CastSessionPlayer(local, mediaFor = { item, contentId -> media(item, contentId) }, clock = { now })
-            .apply { attach(local, remote, positionMs, play) }
+    private fun cast(
+        local: QueuePlayer,
+        remote: FakeRemote,
+        positionMs: Long = 0L,
+        play: Boolean = true,
+        prepare: (MediaItem, (Boolean) -> Unit) -> Unit = { _, done -> done(true) },
+    ) = CastSessionPlayer(local, mediaFor = { item, contentId -> media(item, contentId) }, prepare = prepare, clock = { now })
+        .apply { attach(local, remote, positionMs, play) }
+
+    // ── Preparing songs before the speaker sees them ──────────────────────
+
+    @Test fun `the speaker gets a song only once it's prepared, and buffers until then`() {
+        var pending: ((Boolean) -> Unit)? = null
+        val remote = FakeRemote()
+        val player = cast(QueuePlayer(listOf("a")), remote, prepare = { _, done -> pending = done })
+
+        assertThat(remote.loads).isEmpty()
+        assertThat(player.playbackState).isEqualTo(Player.STATE_BUFFERING)
+
+        pending!!(true)
+        assertThat(remote.loads).hasSize(1)
+    }
+
+    @Test fun `a song that couldn't be prepared is an error the queue can skip`() {
+        val remote = FakeRemote()
+        val player = cast(QueuePlayer(listOf("a", "b")), remote, prepare = { _, done -> done(false) })
+
+        assertThat(remote.loads).isEmpty()
+        assertThat(player.playerError?.errorCode).isEqualTo(PlaybackException.ERROR_CODE_IO_UNSPECIFIED)
+    }
+
+    @Test fun `a skip while a song is still being prepared drops it`() {
+        val pending = mutableListOf<(Boolean) -> Unit>()
+        val remote = FakeRemote()
+        val player = cast(QueuePlayer(listOf("a", "b")), remote, prepare = { _, done -> pending += done })
+
+        player.seekToNextMediaItem()
+        pending.forEach { it(true) } // a's prepare finishes too, after b's load was asked for
+
+        assertThat(remote.loads.map { it.first.substringBefore('#') }).containsExactly("b")
+    }
+
+    @Test fun `a pause while the song is prepared loads it paused`() {
+        var pending: ((Boolean) -> Unit)? = null
+        val remote = FakeRemote()
+        val player = cast(QueuePlayer(listOf("a")), remote, play = true, prepare = { _, done -> pending = done })
+
+        player.pause()
+        pending!!(true)
+
+        assertThat(remote.loads.single().third).isFalse()
+    }
+
+    // ── The next song queued on the speaker ───────────────────────────────
+
+    @Test fun `once a song plays, the next one is queued on the speaker`() {
+        val remote = FakeRemote()
+        cast(QueuePlayer(listOf("a", "b")), remote)
+        assertThat(remote.nexts).isEmpty() // nothing while the load is in flight
+
+        remote.report(CastStatus.PlayerState.PLAYING)
+
+        assertThat(remote.nexts.single()).startsWith("b#n")
+    }
+
+    @Test fun `when the speaker moves on by itself the queue follows, without a reload`() {
+        val local = QueuePlayer(listOf("a", "b", "c"))
+        val remote = FakeRemote()
+        val player = cast(local, remote)
+        remote.report(CastStatus.PlayerState.PLAYING)
+        val queuedB = remote.nexts.single()!!
+
+        remote.report(CastStatus.PlayerState.PLAYING, positionMs = 1_000L, contentId = queuedB)
+
+        assertThat(local.index).isEqualTo(1)
+        assertThat(remote.loads).hasSize(1) // b came from the speaker's own queue
+        assertThat(player.currentPosition).isEqualTo(1_000L)
+        assertThat(remote.nexts.last()).startsWith("c#n") // and c is queued behind it
+    }
+
+    @Test fun `next jumps to the song the speaker already buffered, without a new load`() {
+        val local = QueuePlayer(listOf("a", "b", "c"))
+        val remote = FakeRemote()
+        val player = cast(local, remote)
+        remote.report(CastStatus.PlayerState.PLAYING)
+        val queuedB = remote.nexts.single()!!
+
+        player.seekToNextMediaItem()
+
+        assertThat(remote.calls).containsExactly("playNext")
+        assertThat(remote.loads).hasSize(1)
+        assertThat(local.index).isEqualTo(1)
+
+        remote.report(CastStatus.PlayerState.PLAYING, contentId = queuedB)
+        assertThat(player.playbackState).isEqualTo(Player.STATE_READY)
+        assertThat(remote.nexts.last()).startsWith("c#n") // the one after is queued in turn
+    }
+
+    @Test fun `next loads the song when the speaker turns out to hold nothing queued`() {
+        val local = QueuePlayer(listOf("a", "b"))
+        val remote = FakeRemote()
+        val player = cast(local, remote)
+        remote.report(CastStatus.PlayerState.PLAYING)
+        remote.hasQueued = false // queueing failed on the receiver
+
+        player.seekToNextMediaItem()
+
+        assertThat(remote.loads).hasSize(2)
+        assertThat(remote.lastContentId).startsWith("b#")
+    }
+
+    @Test fun `a song the speaker plays that we no longer queued moves the queue on`() {
+        val local = QueuePlayer(listOf("a", "b", "c"))
+        val remote = FakeRemote()
+        cast(local, remote)
+        remote.report(CastStatus.PlayerState.PLAYING)
+
+        remote.report(CastStatus.PlayerState.PLAYING, contentId = "x#n99") // a stale leftover
+
+        assertThat(local.index).isEqualTo(1)
+        assertThat(remote.lastContentId).startsWith("b#")
+    }
+
+    @Test fun `the previous song still reported during our load is not mistaken for a stray one`() {
+        val local = QueuePlayer(listOf("a", "b", "c"))
+        val remote = FakeRemote()
+        val player = cast(local, remote)
+        remote.report(CastStatus.PlayerState.PLAYING)
+        val songA = remote.lastContentId
+        player.seekTo(2, 0L) // c: not the queued song, so a fresh load
+
+        remote.report(CastStatus.PlayerState.PLAYING, contentId = songA) // the speaker hasn't switched yet
+
+        assertThat(local.index).isEqualTo(2)
+        assertThat(remote.loads).hasSize(2)
+    }
+
+    @Test fun `next before the following song is queued loads it`() {
+        val local = QueuePlayer(listOf("a", "b"))
+        val remote = FakeRemote()
+        val player = cast(local, remote) // no status yet, so nothing is queued
+
+        player.seekToNextMediaItem()
+
+        assertThat(remote.calls).doesNotContain("playNext")
+        assertThat(remote.loads).hasSize(2)
+    }
+
+    @Test fun `a queue edit that changes the next song replaces the queued one`() {
+        val local = QueuePlayer(listOf("a", "b", "c"))
+        val remote = FakeRemote()
+        val player = cast(local, remote)
+        remote.report(CastStatus.PlayerState.PLAYING)
+
+        player.removeMediaItem(1) // b goes; c is next now
+
+        assertThat(remote.nexts).hasSize(3)
+        assertThat(remote.nexts[0]).startsWith("b#n")
+        assertThat(remote.nexts[1]).isNull()
+        assertThat(remote.nexts[2]).startsWith("c#n")
+    }
+
+    @Test fun `repeat one queues nothing, and switching to it takes the queued song back`() {
+        val local = QueuePlayer(listOf("a", "b"))
+        val remote = FakeRemote()
+        val player = cast(local, remote)
+        remote.report(CastStatus.PlayerState.PLAYING)
+
+        player.repeatMode = Player.REPEAT_MODE_ONE
+
+        assertThat(remote.nexts).hasSize(2)
+        assertThat(remote.nexts.last()).isNull()
+    }
+
+    @Test fun `the last song queues nothing`() {
+        val remote = FakeRemote()
+        cast(QueuePlayer(listOf("a")), remote)
+        remote.report(CastStatus.PlayerState.PLAYING)
+
+        assertThat(remote.nexts).isEmpty()
+    }
+
+    // ── Playing ───────────────────────────────────────────────────────────
 
     @Test fun `attaching loads the current song where the phone was`() {
         val local = QueuePlayer(listOf("a", "b")).apply { index = 1 }
@@ -180,17 +367,17 @@ class CastSessionPlayerTest {
         assertThat(local.index).isEqualTo(0)
     }
 
-    @Test fun `skipping moves the phone's queue and loads the next song on the speaker`() {
+    @Test fun `jumping to another song moves the phone's queue and loads it on the speaker`() {
         val local = QueuePlayer(listOf("a", "b", "c"))
         val remote = FakeRemote()
         val player = cast(local, remote)
         remote.report(CastStatus.PlayerState.PLAYING, positionMs = 10_000L)
 
-        player.seekToNextMediaItem()
+        player.seekTo(2, 0L) // c: not the song queued on the speaker (b)
 
-        assertThat(local.index).isEqualTo(1)
+        assertThat(local.index).isEqualTo(2)
         assertThat(remote.loads).hasSize(2)
-        assertThat(remote.lastContentId).startsWith("b#")
+        assertThat(remote.lastContentId).startsWith("c#")
         assertThat(remote.loads.last().second).isEqualTo(0L)
         assertThat(remote.loads.last().third).isTrue()
     }

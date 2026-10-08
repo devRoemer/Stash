@@ -7,6 +7,7 @@ import com.google.android.gms.cast.CastStatusCodes
 import com.google.android.gms.cast.MediaInfo
 import com.google.android.gms.cast.MediaLoadRequestData
 import com.google.android.gms.cast.MediaMetadata
+import com.google.android.gms.cast.MediaQueueItem
 import com.google.android.gms.cast.MediaSeekOptions
 import com.google.android.gms.cast.MediaStatus
 import com.google.android.gms.cast.framework.CastSession
@@ -15,12 +16,16 @@ import com.google.android.gms.common.images.WebImage
 import com.stash.core.media.cast.CastMedia
 import com.stash.core.media.cast.CastRemote
 import com.stash.core.media.cast.CastStatus
+import com.stash.core.media.diagnostics.PlaybackDiagnosticsLog
 
 /**
  * [CastRemote] over one [CastSession]'s [RemoteMediaClient]: a single song on
  * the Default Media Receiver. Main thread only, like the SDK.
  */
-internal class GoogleCastRemote(val session: CastSession) : CastRemote {
+internal class GoogleCastRemote(
+    val session: CastSession,
+    private val diagnostics: PlaybackDiagnosticsLog,
+) : CastRemote {
 
     private val listeners = mutableListOf<() -> Unit>()
 
@@ -36,13 +41,22 @@ internal class GoogleCastRemote(val session: CastSession) : CastRemote {
     /** The newest load we sent. Results for older ones are stale: a quick skip replaces them. */
     private var requestedContentId: String? = null
 
+    /** The song [setNext] queued, until the receiver moves on to it or it's replaced. */
+    private var queuedNextContentId: String? = null
+
     private val client: RemoteMediaClient? get() = session.remoteMediaClient
 
     /** The client [mediaCallback] is registered on; the SDK may hand out a new one after a suspend. */
     private var registeredClient: RemoteMediaClient? = null
 
     private val mediaCallback = object : RemoteMediaClient.Callback() {
-        override fun onStatusUpdated() = notifyListeners()
+        override fun onStatusUpdated() {
+            // The receiver moved on to the queued song: it's the current one now,
+            // and a later setNext must never take it back off the queue.
+            val current = client?.mediaStatus?.mediaInfo?.contentId
+            if (current != null && current == queuedNextContentId) queuedNextContentId = null
+            notifyListeners()
+        }
         override fun onMetadataUpdated() = notifyListeners()
     }
 
@@ -132,21 +146,9 @@ internal class GoogleCastRemote(val session: CastSession) : CastRemote {
         val remote = client ?: return
         failedContentId = null
         requestedContentId = media.contentId
-        val metadata = MediaMetadata(MediaMetadata.MEDIA_TYPE_MUSIC_TRACK).apply {
-            media.title?.let { putString(MediaMetadata.KEY_TITLE, it) }
-            media.artist?.let { putString(MediaMetadata.KEY_ARTIST, it) }
-            media.album?.let { putString(MediaMetadata.KEY_ALBUM_TITLE, it) }
-            media.artworkUrl?.let { addImage(WebImage(Uri.parse(it))) }
-        }
-        val info = MediaInfo.Builder(media.contentId)
-            .setContentUrl(media.url)
-            .setContentType(media.contentType)
-            .setStreamType(MediaInfo.STREAM_TYPE_BUFFERED)
-            .setMetadata(metadata)
-            .apply { if (media.durationMs > 0) setStreamDuration(media.durationMs) }
-            .build()
+        queuedNextContentId = null // the load replaces the receiver's queue
         val request = MediaLoadRequestData.Builder()
-            .setMediaInfo(info)
+            .setMediaInfo(mediaInfo(media))
             .setAutoplay(autoplay)
             .setCurrentTime(startPositionMs)
             .build()
@@ -159,10 +161,64 @@ internal class GoogleCastRemote(val session: CastSession) : CastRemote {
                 code == CastStatusCodes.REPLACED || code == CastStatusCodes.CANCELED
             if (!result.status.isSuccess && !superseded) {
                 Log.w(TAG, "load rejected: $code ${result.status.statusMessage}")
+                diagnostics.recordCast("speaker rejected a load (code $code)")
                 failedContentId = media.contentId
                 notifyListeners()
             }
         }
+    }
+
+    override fun setNext(media: CastMedia?) {
+        val remote = client ?: return
+        // Clear everything after the current song, by item id from the
+        // receiver's own queue list. MediaStatus.queueItems isn't reliably the
+        // whole queue, so looking the old song up there could miss it and leave
+        // it queued: the speaker would then play a song the phone moved past.
+        val currentId = remote.mediaStatus?.currentItemId ?: MediaQueueItem.INVALID_ITEM_ID
+        val ids = runCatching { remote.mediaQueue.itemIds }.getOrNull() ?: IntArray(0)
+        val currentAt = ids.indexOf(currentId)
+        if (currentAt >= 0 && currentAt < ids.lastIndex) {
+            remote.queueRemoveItems(ids.copyOfRange(currentAt + 1, ids.size), null)
+        }
+        queuedNextContentId = null
+        media ?: return
+        val item = MediaQueueItem.Builder(mediaInfo(media))
+            .setAutoplay(true)
+            // Starts buffering this long before the current song ends: the gapless part.
+            .setPreloadTime(PRELOAD_SECONDS)
+            .build()
+        queuedNextContentId = media.contentId
+        remote.queueAppendItem(item, null).setResultCallback { result ->
+            // Not queued after all: playNext must not jump to a song that isn't there.
+            if (!result.status.isSuccess && queuedNextContentId == media.contentId) {
+                Log.w(TAG, "queueing the next song failed: ${result.status.statusCode}")
+                diagnostics.recordCast("queueing the next song failed (code ${result.status.statusCode})")
+                queuedNextContentId = null
+            }
+        }
+    }
+
+    override fun playNext(): Boolean {
+        if (queuedNextContentId == null) return false
+        val remote = client ?: return false
+        remote.queueNext(null)
+        return true
+    }
+
+    private fun mediaInfo(media: CastMedia): MediaInfo {
+        val metadata = MediaMetadata(MediaMetadata.MEDIA_TYPE_MUSIC_TRACK).apply {
+            media.title?.let { putString(MediaMetadata.KEY_TITLE, it) }
+            media.artist?.let { putString(MediaMetadata.KEY_ARTIST, it) }
+            media.album?.let { putString(MediaMetadata.KEY_ALBUM_TITLE, it) }
+            media.artworkUrl?.let { addImage(WebImage(Uri.parse(it))) }
+        }
+        return MediaInfo.Builder(media.contentId)
+            .setContentUrl(media.url)
+            .setContentType(media.contentType)
+            .setStreamType(MediaInfo.STREAM_TYPE_BUFFERED)
+            .setMetadata(metadata)
+            .apply { if (media.durationMs > 0) setStreamDuration(media.durationMs) }
+            .build()
     }
 
     override fun play() {
@@ -205,5 +261,6 @@ internal class GoogleCastRemote(val session: CastSession) : CastRemote {
 
     private companion object {
         const val TAG = "GoogleCastRemote"
+        const val PRELOAD_SECONDS = 20.0
     }
 }
