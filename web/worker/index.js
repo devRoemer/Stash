@@ -2,12 +2,15 @@
  * stashfm.app: the website's Worker. The site itself is static (Astro, ./dist, Workers Static Assets);
  * this adds the early-access gate in front of it, the sign-in flow and the admin page.
  *
- *   GET  /               signed in: the site's home page. Otherwise: the early-access page, with the goal.
- *   GET  /access         the early-access page (signed in: back to /)
+ *   GET  /               the home page, with the goal: its web player section has the sign-in form, or (signed in)
+ *                        a button to /player, and only a signed-in visitor gets the footer's Sign out button
+ *   GET  /access         the early-access sign-in page (signed in: back to /)
  *   POST /access         email in -> a sign-in code by email, if that email has access. The same answer either way.
  *   POST /access/verify  email + code -> the stash_access cookie, then back to /
  *   GET  /request        the request-access form;  POST /request  stores the request (same answer either way)
  *   POST /signout        clears the cookie
+ *   GET  /player         signed in with early access: a 2-minute ticket and a 302 to the web player (player.js).
+ *                        Not signed in: the early-access sign-in page, which comes back to /player after signing in.
  *   GET|POST /admin      requests, the access list and the goal (Cloudflare Access + access-jwt.js)
  *
  * Anything else goes to the static assets: files, /privacy and the 404 page are public, and any other HTML
@@ -32,7 +35,8 @@ import { currentGoal, goalTarget, goalView } from "./goal.js";
 import { clientKey, readForm, sameOrigin } from "./http.js";
 import { KEYS } from "./keys.js";
 import { fetchAsset, fill, gatePage, personal, withSecurityHeaders } from "./pages.js";
-import { clearedCookie, currentSession, hasAccess, rememberAccess, sessionCookie, sessionSecret, signSession } from "./session.js";
+import { authUrl, mintTicket, playerNext, playerOrigin, playerPath, playerReturn, playerSub, ticketKey } from "./player.js";
+import { clearedCookie, cookieValue, currentSession, hasAccess, readSession, rememberAccess, sessionCookie, sessionSecret, signSession } from "./session.js";
 
 /** HTML pages anyone can see. Files (CSS, images, fonts, XML) are always public. */
 const PUBLIC_PAGES = new Set(["/privacy"]);
@@ -77,9 +81,13 @@ async function route(request, env, later, fetchImpl) {
     switch (path) {
         case "/":
             if (method !== "GET") return notAllowed("GET");
-            return (await currentSession(request, env)) ? home(env, url) : front(env, url);
+            return home(env, url, Boolean(await currentSession(request, env)));
         case "/access":
-            if (method === "GET") return (await currentSession(request, env)) ? seeOther("/") : front(env, url);
+            if (method === "GET") {
+                // ?next= is where to go after signing in: only ever /player (with a shared song or mix), see player.js.
+                const back = playerReturn(url.searchParams.get("next"));
+                return (await currentSession(request, env)) ? seeOther(back || "/") : front(env, url, back);
+            }
             if (method === "POST") return sendCode(request, env, url, later);
             return notAllowed("GET, POST");
         case "/access/verify":
@@ -96,6 +104,9 @@ async function route(request, env, later, fetchImpl) {
             return notAllowed("GET, POST");
         case "/admin":
             return adminRoute(request, env, url, method, fetchImpl);
+        case "/player":
+            if (method !== "GET") return notAllowed("GET");
+            return player(request, env, url);
     }
     // The gate's own page templates are only ever served through the routes above (however the path is spelled).
     if (/^\/gate(?:[/.]|$)/.test(loosePath(path))) return env.ASSETS.fetch(new Request(new URL("/404-not-a-page", url.origin)));
@@ -135,14 +146,19 @@ async function goalFor(env) {
     }
 }
 
-async function front(env, url) {
-    return gatePage(env, url, "front", { goal: await goalFor(env) });
+/** The early-access sign-in page (/access). [back] (from playerReturn) goes in the sign-in form, to come back to after signing in. */
+async function front(env, url, back = null) {
+    return gatePage(env, url, "front", { goal: await goalFor(env), text: back ? { next: back } : {} });
 }
 
-/** The real home page, for a signed-in visitor. Its support section shows the goal too. */
-async function home(env, url) {
+/**
+ * The home page, for everyone, with the goal. Its web player section has two versions (data-if): the sign-in
+ * form for a visitor who isn't signed in, and a button to /player for one who is; the footer's Sign out button
+ * is only for a signed-in visitor.
+ */
+async function home(env, url, signedIn) {
     const res = await fetchAsset(env, url, "/");
-    return personal(fill(res, { goal: await goalFor(env) }));
+    return personal(fill(res, { goal: await goalFor(env), flags: { "signed-in": signedIn, "signed-out": !signedIn } }));
 }
 
 function problem(env, url, status, message, title = "Something went wrong") {
@@ -186,6 +202,7 @@ async function sendCode(request, env, url, later) {
     if (response) return response;
     const email = normalizeEmail(form.email);
     if (!validEmail(email)) return problem(env, url, 400, "That doesn't look like an email address. Go back and check it.", "Check that email");
+    const back = playerReturn(form.next);
     if (!(await env.SEND_IP_RL.limit({ key: clientKey(request) })).success) return slowDown(env, url);
     const h = await hashEmail(email, env.EMAIL_PEPPER);
     // Visible to everyone, listed or not: 3 asks a minute per email.
@@ -200,7 +217,7 @@ async function sendCode(request, env, url, later) {
             })().catch((err) => console.error("code not sent:", err && err.message)),
         );
     }
-    return gatePage(env, url, "sent", { text: { email } });
+    return gatePage(env, url, "sent", { text: back ? { email, next: back } : { email } });
 }
 
 /** POST /access/verify: the right code signs you in; anything else gets one answer for every kind of failure. */
@@ -210,7 +227,8 @@ async function verify(request, env, url, later) {
     if (!(await env.VERIFY_IP_RL.limit({ key: clientKey(request) })).success) return slowDown(env, url);
     const email = normalizeEmail(form.email);
     const code = cleanCode(form.code);
-    const failed = () => gatePage(env, url, "code-failed", { status: 400, text: { email } });
+    const back = playerReturn(form.next);
+    const failed = () => gatePage(env, url, "code-failed", { status: 400, text: back ? { email, next: back } : { email } });
     if (!validEmail(email)) return failed();
     const h = await hashEmail(email, env.EMAIL_PEPPER);
     // Every email, before its code is looked up: 5 tries a minute, however many addresses they come from.
@@ -219,7 +237,7 @@ async function verify(request, env, url, later) {
     if (!(await checkCode(env, secret, h, code, later))) return failed();
     rememberAccess(h, undefined);
     if (!(await hasAccess(env, h))) return failed(); // removed while the code was on its way
-    return seeOther("/", { "Set-Cookie": sessionCookie(await signSession(secret, h)) });
+    return seeOther(back || "/", { "Set-Cookie": sessionCookie(await signSession(secret, h)) });
 }
 
 /** POST /request: keeps {email, note} until someone handles it (or 30 days). The same answer whoever asks. */
@@ -245,4 +263,30 @@ async function requestAccess(request, env, url, later) {
 async function signOut(request, env, url) {
     if (!sameOrigin(request, url)) return problem(env, url, 403, "That form came from somewhere else, so it was ignored.");
     return gatePage(env, url, "signed-out", { headers: { "Set-Cookie": clearedCookie } });
+}
+
+/**
+ * GET /player: a ticket to the web player for a signed-in visitor with early access (player.js). Signed out,
+ * the early-access sign-in page, back here afterwards; signed in but no longer on the list, the home page as a
+ * signed-out visitor sees it. Without a working PLAYER_URL and PLAYER_TICKET_PRIVATE_KEY, a 503 that names neither.
+ */
+async function player(request, env, url) {
+    const origin = playerOrigin(env.PLAYER_URL);
+    const key = await ticketKey(env.PLAYER_TICKET_PRIVATE_KEY);
+    if (!origin || !key) {
+        const missing = [!origin && "PLAYER_URL (an https origin)", !key && "PLAYER_TICKET_PRIVATE_KEY (a private Ed25519 JWK)"].filter(Boolean);
+        console.error(`/player is off, missing or invalid: ${missing.join(", ")}`);
+        return problem(env, url, 503, "The web player isn't available right now. Try again later.", "The player isn't available");
+    }
+    const next = playerNext(url.searchParams.get("next"));
+    const secret = sessionSecret(env);
+    const session = await readSession(secret, cookieValue(request));
+    if (!session) return seeOther(`/access?next=${encodeURIComponent(playerPath(next))}`);
+    rememberAccess(session.h, undefined); // read the list fresh: one ticket starts a player session, so the cache must not outlive a removal
+    if (!(await hasAccess(env, session.h))) return seeOther("/");
+    const ticket = await mintTicket(key, await playerSub(secret, session.h), Math.floor(clock.now() / 1000));
+    return new Response(null, {
+        status: 302,
+        headers: { Location: authUrl(origin, ticket, next), "Cache-Control": "no-store", Vary: "Cookie", "Referrer-Policy": "no-referrer" },
+    });
 }
