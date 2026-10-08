@@ -154,6 +154,9 @@ class CastMediaServerTest {
         assertThat(
             CastMediaServer.pickLanAddress(listOf("rmnet_data0" to ip(10, 44, 0, 7), "tun0" to ip(10, 8, 0, 2))),
         ).isNull()
+        // An IPv6-only Wi-Fi's 464XLAT shim has an IPv4 address no speaker can reach.
+        assertThat(CastMediaServer.pickLanAddress(listOf("v4-wlan0" to ip(192, 0, 0, 4)))).isNull()
+        assertThat(CastMediaServer.pickLanAddress(listOf("wlan0" to ip(192, 0, 0, 4)))).isNull()
     }
 
     @Test fun `accepts a carrier-grade NAT LAN, prefers a private address, skips link-local`() {

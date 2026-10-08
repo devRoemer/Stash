@@ -78,7 +78,7 @@ class CastMediaServer(
     @Volatile private var serverSocket: ServerSocket? = null
     @Volatile private var boundAddress: InetAddress? = null
     private var workers: ExecutorService? = null
-    private var baseUrl: String? = null
+    @Volatile private var baseUrl: String? = null
 
     val isRunning: Boolean get() = serverSocket != null
 
@@ -385,8 +385,8 @@ class CastMediaServer(
         private const val MAX_HEADER_BYTES = 16 * 1024
         private val KINDS = setOf("m", "a")
 
-        /** Mobile data (Qualcomm, MediaTek) and VPN tunnels. */
-        private val NON_LAN_INTERFACES = listOf("rmnet", "ccmni", "tun", "ppp")
+        /** Mobile data (Qualcomm, MediaTek), VPN tunnels, and 464XLAT's IPv4 shim (`v4-wlan0`, `v4-rmnet_data0`). */
+        private val NON_LAN_INTERFACES = listOf("rmnet", "ccmni", "tun", "ppp", "v4-")
 
         /** Reads the request line and headers. Null for an empty or malformed request. */
         fun readRequest(input: InputStream, deadlineMs: Long = Long.MAX_VALUE): Request? {
@@ -477,12 +477,18 @@ class CastMediaServer(
             }
             return candidates
                 .filterNot { (name, _) -> NON_LAN_INTERFACES.any { name.startsWith(it) } }
-                .filter { (_, it) -> it is Inet4Address && !it.isLoopbackAddress && !it.isLinkLocalAddress && !it.isAnyLocalAddress }
+                .filter { (_, it) -> it is Inet4Address && !it.isLoopbackAddress && !it.isLinkLocalAddress && !it.isAnyLocalAddress && !isClatAddress(it) }
                 .minByOrNull { (name, address) -> rank(name, address) }
                 ?.second
         }
 
         /** Monotonic milliseconds; System.nanoTime so it runs under plain JVM tests too. */
+        /** 192.0.0.0/29: the address 464XLAT gives an IPv6-only network's IPv4 shim. No speaker can reach it. */
+        private fun isClatAddress(address: InetAddress): Boolean {
+            val b = address.address
+            return b.size == 4 && b[0] == 192.toByte() && b[1] == 0.toByte() && b[2] == 0.toByte() && (b[3].toInt() and 0xF8) == 0
+        }
+
         private fun nowMs(): Long = System.nanoTime() / 1_000_000
 
         private fun readFully(source: DataSource, into: ByteArray, max: Int): Int {
