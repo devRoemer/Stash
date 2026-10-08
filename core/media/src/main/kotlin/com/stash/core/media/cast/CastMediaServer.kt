@@ -98,7 +98,7 @@ class CastMediaServer(
         val socket = try {
             ServerSocket(0, BACKLOG, address)
         } catch (e: IOException) {
-            Log.w(TAG, "bind failed on ${address.hostAddress}", e)
+            Log.w(TAG, "bind failed on the ${addressKind(address)} LAN address", e)
             onEvent("server: bind failed")
             return false
         }
@@ -115,7 +115,7 @@ class CastMediaServer(
         }
         workers = pool
         Thread({ acceptLoop(socket, pool) }, "cast-media-accept").apply { isDaemon = true }.start()
-        Log.i(TAG, "serving on ${address.hostAddress}:${socket.localPort}")
+        Log.i(TAG, "serving on the ${addressKind(address)} LAN address") // never the address, port or token: logcat goes into shared diagnostics
         onEvent("server: started")
         return true
     }
@@ -249,10 +249,10 @@ class CastMediaServer(
         } catch (e: SocketException) {
             // The speaker hung up mid-song (seek, skip, stop). Routine.
         } catch (e: IOException) {
-            Log.w(TAG, "serving ${request.path} failed: ${e.message}")
+            Log.w(TAG, "serving ${loggable(request.path)} failed: ${e.message}")
         } catch (e: RuntimeException) {
             // Uncaught here it would kill the whole app from this worker thread.
-            Log.w(TAG, "serving ${request.path} failed", e)
+            Log.w(TAG, "serving ${loggable(request.path)} failed", e)
             onEvent("server: request failed (${e.javaClass.simpleName})")
             runCatching { respondEmpty(out, 500, "Internal Server Error") }
         }
@@ -360,6 +360,12 @@ class CastMediaServer(
 
     private fun tokenMatches(candidate: String): Boolean =
         MessageDigest.isEqual(candidate.toByteArray(), token.toByteArray())
+
+    /** A request path fit for logcat, which goes into shared diagnostics: the token never is. */
+    private fun loggable(path: String): String = path.replace(token, "<token>")
+
+    /** What kind of address the server is on, for logcat: never the address itself. */
+    private fun addressKind(address: InetAddress): String = if (address.isSiteLocalAddress) "private" else "non-private"
 
     private fun respondEmpty(out: OutputStream, code: Int, reason: String) {
         out.write("HTTP/1.1 $code $reason\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray(Charsets.US_ASCII))

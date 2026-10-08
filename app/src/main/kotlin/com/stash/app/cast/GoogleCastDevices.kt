@@ -226,7 +226,7 @@ class GoogleCastDevices @Inject constructor(
 
     private fun onConnectTimedOut() {
         val name = (_connection.value as? CastConnection.Connecting)?.deviceName ?: return
-        Log.w(TAG, "no answer from $name after ${CONNECT_TIMEOUT_MS}ms — giving up")
+        Log.w(TAG, "no answer from the speaker after ${CONNECT_TIMEOUT_MS}ms — giving up") // never its name: logcat goes into shared diagnostics
         diagnostics.recordCast("connect timed out after ${CONNECT_TIMEOUT_MS / 1000} s")
         onDisconnected()
         endSessionAndReleaseRoute()
