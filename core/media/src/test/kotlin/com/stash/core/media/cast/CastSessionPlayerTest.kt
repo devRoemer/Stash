@@ -56,6 +56,14 @@ class CastSessionPlayerTest {
             return done()
         }
 
+        override fun handleSetMediaItems(mediaItems: List<MediaItem>, startIndex: Int, startPositionMs: Long): ListenableFuture<*> {
+            items.clear()
+            items.addAll(mediaItems)
+            index = if (startIndex == C.INDEX_UNSET) 0 else startIndex
+            positionMs = if (startPositionMs == C.TIME_UNSET) 0 else startPositionMs
+            return done()
+        }
+
         override fun handleRemoveMediaItems(fromIndex: Int, toIndex: Int): ListenableFuture<*> {
             repeat(toIndex - fromIndex) { items.removeAt(fromIndex) }
             if (index >= toIndex) index -= toIndex - fromIndex
@@ -429,6 +437,48 @@ class CastSessionPlayerTest {
         remote.report(CastStatus.PlayerState.IDLE, CastStatus.IdleReason.FINISHED)
 
         assertThat(remote.loads).hasSize(2)
+    }
+
+    @Test fun `playing the song that just ended again loads it on the speaker`() {
+        val remote = FakeRemote()
+        val player = cast(QueuePlayer(listOf("a")), remote)
+        remote.report(CastStatus.PlayerState.PLAYING)
+        remote.report(CastStatus.PlayerState.IDLE, CastStatus.IdleReason.FINISHED)
+        assertThat(player.playbackState).isEqualTo(Player.STATE_ENDED)
+
+        // What PlayerRepositoryImpl.playQueue does when the user taps the song again.
+        player.setMediaItems(listOf(item("a"), item("b")), 0, 0L)
+        player.prepare()
+        player.play()
+
+        assertThat(remote.loads).hasSize(2)
+        assertThat(remote.lastContentId).startsWith("a#")
+        assertThat(remote.loads.last().second).isEqualTo(0L)
+        assertThat(player.playbackState).isEqualTo(Player.STATE_BUFFERING)
+    }
+
+    @Test fun `starting a new queue on the song that is playing restarts it from the new position`() {
+        val remote = FakeRemote()
+        val player = cast(QueuePlayer(listOf("a", "b")), remote)
+        remote.report(CastStatus.PlayerState.PLAYING, positionMs = 130_000L)
+
+        player.setMediaItems(listOf(item("x"), item("a")), 1, 0L)
+
+        assertThat(remote.loads).hasSize(2)
+        assertThat(remote.lastContentId).startsWith("a#")
+        assertThat(remote.loads.last().second).isEqualTo(0L)
+    }
+
+    @Test fun `a new queue starting on a different song loads it once`() {
+        val remote = FakeRemote()
+        val player = cast(QueuePlayer(listOf("a")), remote)
+        remote.report(CastStatus.PlayerState.PLAYING)
+
+        player.setMediaItems(listOf(item("c"), item("d")), 0, 5_000L)
+
+        assertThat(remote.loads).hasSize(2)
+        assertThat(remote.lastContentId).startsWith("c#")
+        assertThat(remote.loads.last().second).isEqualTo(5_000L)
     }
 
     @Test fun `swapping the current song's placeholder for its resolved URL doesn't restart it`() {

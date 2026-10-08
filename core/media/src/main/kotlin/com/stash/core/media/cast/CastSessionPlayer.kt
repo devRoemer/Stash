@@ -537,6 +537,21 @@ class CastSessionPlayer(
         return DONE
     }
 
+    /**
+     * A new queue is a request to play its start item from its start position,
+     * even when that is the song the speaker already holds: reconcile leaves
+     * the same song alone (a placeholder swap, a queue edit), so tapping the
+     * song that just finished, or the one playing, would otherwise do nothing
+     * or carry on mid-song. Loads here unless the queue change already did.
+     */
+    override fun handleSetMediaItems(mediaItems: List<MediaItem>, startIndex: Int, startPositionMs: Long): ListenableFuture<*> {
+        if (remote == null) return super.handleSetMediaItems(mediaItems, startIndex, startPositionMs)
+        val before = loadCounter
+        val result = super.handleSetMediaItems(mediaItems, startIndex, startPositionMs)
+        if (loadCounter == before && player.currentMediaItem != null) load(player.currentPosition.coerceAtLeast(0))
+        return result
+    }
+
     override fun handleSetPlaybackParameters(playbackParameters: PlaybackParameters): ListenableFuture<*> =
         if (remote == null) super.handleSetPlaybackParameters(playbackParameters) else DONE
 
