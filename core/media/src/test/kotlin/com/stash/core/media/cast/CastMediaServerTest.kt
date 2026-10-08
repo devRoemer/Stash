@@ -285,6 +285,79 @@ class CastMediaServerTest {
         }
     }
 
+    private fun guarded(maxClients: Int = 16, headerTimeoutMs: Int = 5_000) = CastMediaServer(
+        audioSource = { ByteArrayDataSource(song) },
+        artworkSource = { ByteArrayDataSource(song) },
+        bindAddress = { InetAddress.getLoopbackAddress() },
+        maxClients = maxClients,
+        headerTimeoutMs = headerTimeoutMs,
+    )
+
+    /** Reads until the server ends the connection; the milliseconds that took. Fails on a client-side timeout. */
+    private fun msUntilClosed(socket: Socket): Long {
+        val started = System.nanoTime()
+        socket.soTimeout = 5_000
+        val ended = runCatching { while (socket.getInputStream().read() != -1) Unit }
+        assertThat(ended.exceptionOrNull()).isNotInstanceOf(java.net.SocketTimeoutException::class.java)
+        return (System.nanoTime() - started) / 1_000_000
+    }
+
+    @Test fun `a flood of connections is turned away at the door, and the speaker gets in once it ends`() {
+        val guarded = guarded(maxClients = 2)
+        try {
+            guarded.start()
+            val url = Uri.parse(guarded.audioUrl(Uri.parse("file:///music/a"), payload = null)!!)
+            val idle = List(2) { Socket(url.host, url.port) }
+            Thread.sleep(300) // both accepted and waiting for a request
+
+            Socket(url.host, url.port).use { extra -> assertThat(msUntilClosed(extra)).isLessThan(2_000L) }
+
+            idle.forEach { it.close() }
+            // The idle ones' slots free up as their handlers see the close.
+            var status = 0
+            val deadline = System.nanoTime() + 3_000_000_000L
+            while (status != 200 && System.nanoTime() < deadline) {
+                status = runCatching { request(url.toString()).status }.getOrDefault(0)
+                if (status != 200) Thread.sleep(50)
+            }
+            assertThat(status).isEqualTo(200)
+        } finally {
+            guarded.stop()
+        }
+    }
+
+    @Test fun `a client that connects and says nothing is dropped after the header timeout`() {
+        val guarded = guarded(headerTimeoutMs = 300)
+        try {
+            guarded.start()
+            val url = Uri.parse(guarded.audioUrl(Uri.parse("file:///music/a"), payload = null)!!)
+            Socket(url.host, url.port).use { silent -> assertThat(msUntilClosed(silent)).isLessThan(2_500L) }
+        } finally {
+            guarded.stop()
+        }
+    }
+
+    @Test fun `a client trickling its request a byte at a time is dropped at the header deadline`() {
+        val guarded = guarded(headerTimeoutMs = 300)
+        try {
+            guarded.start()
+            val url = Uri.parse(guarded.audioUrl(Uri.parse("file:///music/a"), payload = null)!!)
+            Socket(url.host, url.port).use { slow ->
+                // Each byte arrives well inside the read timeout; only the overall deadline catches it.
+                val drip = Thread {
+                    runCatching {
+                        val out = slow.getOutputStream()
+                        repeat(100) { out.write('G'.code); out.flush(); Thread.sleep(100) }
+                    }
+                }.apply { isDaemon = true; start() }
+                assertThat(msUntilClosed(slow)).isLessThan(2_500L)
+                drip.interrupt()
+            }
+        } finally {
+            guarded.stop()
+        }
+    }
+
     @Test fun `range parsing`() {
         assertThat(CastMediaServer.parseRange("bytes=0-")).isEqualTo(0L to null)
         assertThat(CastMediaServer.parseRange("bytes=10-20")).isEqualTo(10L to 20L)

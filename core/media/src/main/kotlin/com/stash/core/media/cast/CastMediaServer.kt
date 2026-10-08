@@ -50,6 +50,10 @@ class CastMediaServer(
     private val bindAddress: () -> InetAddress? = ::lanAddress,
     /** Notes for the diagnostics bundle: fixed words, never an address. */
     private val onEvent: (String) -> Unit = {},
+    /** Connections served at once; more are closed on arrival. Tests lower it. */
+    private val maxClients: Int = MAX_CLIENTS,
+    /** How long a client gets to send its whole request, before the token is even checked. */
+    private val headerTimeoutMs: Int = HEADER_TIMEOUT_MS,
 ) {
     /** What one URL serves. [key] is opaque to callers; [payload] lets [audioSource] route the read. */
     class Entry internal constructor(val uri: Uri, val payload: Any?, internal val isArtwork: Boolean) {
@@ -101,11 +105,11 @@ class CastMediaServer(
         serverSocket = socket
         boundAddress = address
         baseUrl = "http://${address.hostAddress}:${socket.localPort}/$token"
-        // Unbounded, not fixed: a speaker switched off mid-song leaves its
+        // Cached, not fixed: a speaker switched off mid-song leaves its
         // connection's thread stuck in a write (no timeout covers writes) until
-        // TCP gives up, minutes later. A fixed pool would run out of threads and
-        // stop answering. Threads are cheap, idle ones exit after a minute, and
-        // only the speaker's own few connections ever get past the token check.
+        // TCP gives up, minutes later, and a small fixed pool would run out.
+        // The accept loop caps the connections served at once (maxClients), so
+        // a stranger on the network opening thousands can't exhaust threads.
         val pool = Executors.newCachedThreadPool { r ->
             Thread(r, "cast-media-server").apply { isDaemon = true }
         }
@@ -205,6 +209,12 @@ class CastMediaServer(
             } catch (e: IOException) {
                 break // closed by stop()
             }
+            if (clients.size >= maxClients) {
+                // Far more than a speaker opens (the song, the next one, their
+                // covers, a few draining after seeks): someone else is flooding us.
+                runCatching { client.close() }
+                continue
+            }
             clients += client
             try {
                 pool.execute {
@@ -222,15 +232,18 @@ class CastMediaServer(
     }
 
     private fun handle(client: Socket) {
-        client.soTimeout = READ_TIMEOUT_MS
+        // The request must arrive whole within headerTimeoutMs: a client that
+        // connects and trickles bytes can't hold a connection slot for long.
+        client.soTimeout = headerTimeoutMs
         // Buffered: readRequest reads byte by byte, which on a raw socket is a syscall per byte.
         val input = java.io.BufferedInputStream(client.getInputStream(), MAX_HEADER_BYTES)
         val out = BufferedOutputStream(client.getOutputStream(), BUFFER_SIZE)
         val request = try {
-            readRequest(input)
+            readRequest(input, deadlineMs = nowMs() + headerTimeoutMs)
         } catch (e: IOException) {
             return
         } ?: return
+        client.soTimeout = READ_TIMEOUT_MS
         try {
             serve(request, out)
         } catch (e: SocketException) {
@@ -360,6 +373,8 @@ class CastMediaServer(
         private const val BACKLOG = 16
         private const val MAX_ENTRIES = 32
         private const val READ_TIMEOUT_MS = 30_000
+        private const val HEADER_TIMEOUT_MS = 5_000
+        private const val MAX_CLIENTS = 16
         private const val BUFFER_SIZE = 64 * 1024
         private const val MAX_HEADER_BYTES = 16 * 1024
         private val KINDS = setOf("m", "a")
@@ -368,7 +383,7 @@ class CastMediaServer(
         private val NON_LAN_INTERFACES = listOf("rmnet", "ccmni", "tun", "ppp")
 
         /** Reads the request line and headers. Null for an empty or malformed request. */
-        fun readRequest(input: InputStream): Request? {
+        fun readRequest(input: InputStream, deadlineMs: Long = Long.MAX_VALUE): Request? {
             val lines = mutableListOf<String>()
             val line = StringBuilder()
             var total = 0
@@ -376,6 +391,7 @@ class CastMediaServer(
                 val b = input.read()
                 if (b == -1) return null
                 if (++total > MAX_HEADER_BYTES) return null
+                if (nowMs() > deadlineMs) return null
                 if (b == '\n'.code) {
                     val text = line.toString().trimEnd('\r')
                     line.setLength(0)
@@ -459,6 +475,9 @@ class CastMediaServer(
                 .minByOrNull { (name, address) -> rank(name, address) }
                 ?.second
         }
+
+        /** Monotonic milliseconds; System.nanoTime so it runs under plain JVM tests too. */
+        private fun nowMs(): Long = System.nanoTime() / 1_000_000
 
         private fun readFully(source: DataSource, into: ByteArray, max: Int): Int {
             var filled = 0
