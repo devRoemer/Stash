@@ -113,6 +113,9 @@ class CastSessionPlayer(
 
     val isAttached: Boolean get() = remote != null
 
+    /** Whether this plays through [remote] now (the service re-points it when the receiver changes). */
+    fun isAttachedTo(remote: CastRemote): Boolean = this.remote === remote
+
     /**
      * Starts casting to [remote], picking up where [local] is. The caller has
      * already stopped [local]; [positionMs] and [playWhenReady] are what it

@@ -698,7 +698,19 @@ class StashPlaybackService : MediaLibraryService() {
      */
     @OptIn(UnstableApi::class)
     private fun enterCast(remote: com.stash.core.media.cast.CastRemote) {
-        if (isCasting) return
+        if (isCasting) {
+            // A new receiver without a disconnect in between (a session the SDK
+            // resumed as a new one): follow it where the old one was, instead of
+            // driving a dead session.
+            val wrapper = castPlayer ?: return
+            if (!wrapper.isAttachedTo(remote)) {
+                val master = crossfadeEngine?.masterPlayer ?: return
+                android.util.Log.i("StashPlayback", "cast: receiver changed, moving playback to it")
+                playbackDiagnosticsLog.recordCast("receiver changed")
+                wrapper.attach(master, remote, wrapper.currentPosition, wrapper.playWhenReady)
+            }
+            return
+        }
         val engine = crossfadeEngine ?: return
         // The two exclude each other (spec §3): Listen Together owns the player for the session.
         if (listenTogetherController.active.value) {

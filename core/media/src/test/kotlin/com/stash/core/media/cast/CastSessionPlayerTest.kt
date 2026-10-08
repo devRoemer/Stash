@@ -577,6 +577,22 @@ class CastSessionPlayerTest {
         assertThat(player.isCommandAvailable(Player.COMMAND_SET_SPEED_AND_PITCH)).isFalse()
     }
 
+    @Test fun `re-pointed at a new receiver, it loads the song there where the old one was`() {
+        val local = QueuePlayer(listOf("a", "b"))
+        val old = FakeRemote()
+        val player = cast(local, old)
+        old.report(CastStatus.PlayerState.PLAYING, positionMs = 42_000L)
+
+        val fresh = FakeRemote()
+        player.attach(local, fresh, player.currentPosition, player.playWhenReady)
+
+        assertThat(player.isAttachedTo(fresh)).isTrue()
+        assertThat(fresh.loads.single().first).startsWith("a#")
+        assertThat(fresh.loads.single().second).isEqualTo(42_000L)
+        old.report(CastStatus.PlayerState.PAUSED, positionMs = 50_000L) // the old one is ignored now
+        assertThat(player.playWhenReady).isTrue()
+    }
+
     @Test fun `detaching hands back the speaker's song and position`() {
         val local = QueuePlayer(listOf("a", "b"))
         val remote = FakeRemote()
