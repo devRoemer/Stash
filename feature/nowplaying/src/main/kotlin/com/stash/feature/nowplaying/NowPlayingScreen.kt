@@ -429,7 +429,7 @@ fun NowPlayingScreen(
         )
     }
 
-    // Sleep timer bottom sheet — opened by the icon next to the track title.
+    // Cast speaker sheet — opened by the cast icon in the top bar.
     if (showCastSheet) {
         com.stash.feature.nowplaying.cast.CastSheet(
             viewModel = castViewModel,
@@ -437,6 +437,7 @@ fun NowPlayingScreen(
         )
     }
 
+    // Sleep timer bottom sheet — opened by the icon next to the track title.
     if (showSleepTimerSheet) {
         SleepTimerSheet(
             currentState = sleepTimerState,
