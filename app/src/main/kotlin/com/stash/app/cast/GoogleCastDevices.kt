@@ -35,9 +35,10 @@ import javax.inject.Singleton
  * and an AppCompat theme. Selecting a cast route makes the SDK start a
  * session; [sessionListener] turns that into [remote].
  *
- * Main thread only. Starts Cast lazily on first injection; until the SDK is
- * up (or forever, without Play Services) [connection] stays Unavailable and
- * the cast button stays hidden.
+ * Main thread only. Without Play Services [connection] stays Unavailable and
+ * the cast button stays hidden. With them it is Disconnected from the start,
+ * but the Cast framework itself only starts when the speaker sheet first scans
+ * ([startScan]), so a phone that never casts never runs it.
  */
 @Singleton
 class GoogleCastDevices @Inject constructor(
@@ -146,20 +147,37 @@ class GoogleCastDevices @Inject constructor(
         }
     }
 
+    /** True once [ensureStarted] has asked for the CastContext. */
+    private var starting = false
+
     init {
+        // Only a local check here, so the button can show. The Cast framework
+        // itself (which looks for speakers on the network now and then while
+        // the app is open, once it exists) starts on the first open of the
+        // speaker sheet, never just because something played.
         val playServices = GoogleApiAvailability.getInstance().isGooglePlayServicesAvailable(context)
         if (playServices == ConnectionResult.SUCCESS) {
-            CastContext.getSharedInstance(context, ContextCompat.getMainExecutor(context))
-                .addOnSuccessListener { ready(it) }
-                .addOnFailureListener { Log.w(TAG, "Cast unavailable", it) }
+            setConnection(CastConnection.Disconnected)
         } else {
             Log.i(TAG, "no Play Services ($playServices) — Cast stays off")
         }
     }
 
+    /** Starts the Cast framework, once. Until it's ready, scanning waits and connect does nothing. */
+    private fun ensureStarted() {
+        if (starting || _connection.value == CastConnection.Unavailable) return
+        starting = true
+        CastContext.getSharedInstance(context, ContextCompat.getMainExecutor(context))
+            .addOnSuccessListener { ready(it) }
+            .addOnFailureListener {
+                Log.w(TAG, "Cast unavailable", it)
+                diagnostics.recordCast("Cast failed to start")
+                setConnection(CastConnection.Unavailable) // hides the button
+            }
+    }
+
     private fun ready(cast: CastContext) {
         castContext = cast
-        setConnection(CastConnection.Disconnected)
         cast.sessionManager.addSessionManagerListener(sessionListener, CastSession::class.java)
         cast.sessionManager.currentCastSession?.takeIf { it.isConnected }?.let(::onConnected)
         if (scanning) startScan()
@@ -185,7 +203,7 @@ class GoogleCastDevices @Inject constructor(
 
     override fun startScan() {
         scanning = true
-        if (castContext == null) return // ready() resumes it
+        if (castContext == null) return ensureStarted() // ready() resumes the scan
         router.addCallback(selector, routerCallback, MediaRouter.CALLBACK_FLAG_PERFORM_ACTIVE_SCAN)
         publishRoutes()
     }
@@ -197,6 +215,7 @@ class GoogleCastDevices @Inject constructor(
     }
 
     override fun connect(deviceId: String) {
+        if (castContext == null) return // the speakers listed came from a started Cast
         val route = router.routes.firstOrNull { it.id == deviceId } ?: return
         // MediaRouter ignores selecting the route it already holds as selected,
         // without a callback. That happens when an earlier session ended without
