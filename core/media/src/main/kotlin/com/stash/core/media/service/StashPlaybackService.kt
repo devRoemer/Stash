@@ -853,8 +853,10 @@ class StashPlaybackService : MediaLibraryService() {
      * a paused, ended or failed speaker asks the media server for nothing, so
      * there is no reason to keep the CPU and Wi-Fi awake for it. Play takes
      * them again as soon as the session reports it.
+     *
+     * Visibility is `internal` so unit tests can invoke it directly.
      */
-    private fun updateCastLocks(idle: Boolean) {
+    internal fun updateCastLocks(idle: Boolean) {
         if (idle) releaseCastLocks() else acquireCastLocks()
     }
 
