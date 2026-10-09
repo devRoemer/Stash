@@ -88,6 +88,18 @@ class CastSessionPlayer(
     private var ended = false
     private var error: PlaybackException? = null
     private var lastPositionMs = 0L
+
+    /**
+     * When [lastPositionMs] was taken, and whether the song was playing then.
+     * The receiver sends status on changes only, not as it plays, and once its
+     * session is suspended or ended the SDK drops the media client, so the
+     * status has no position at all. Playback then continues from
+     * [lastPositionMs] moved on by the time since, not from where the last
+     * status (maybe minutes ago) left it: handing back to the phone after a
+     * lost connection, or moving to a receiver the SDK resumed as a new session.
+     */
+    private var positionTakenAtMs = 0L
+    private var positionAdvancing = false
     private var remoteDurationMs = 0L
 
     /** When we last sent a play/pause; a status inside the grace window is ours echoing back, not the speaker's own. */
@@ -129,7 +141,7 @@ class CastSessionPlayer(
         playWhenReadyReason = Player.PLAY_WHEN_READY_CHANGE_REASON_REMOTE
         ended = false
         error = null
-        lastPositionMs = positionMs.coerceAtLeast(0)
+        notePosition(positionMs.coerceAtLeast(0), advancing = false)
         remote.addListener(remoteListener)
         local.addListener(localListener)
         if (local.currentMediaItem != null) load(lastPositionMs) else invalidateState()
@@ -186,7 +198,7 @@ class CastSessionPlayer(
         loadedContentId = contentId
         finishedContentId = null
         remoteDurationMs = 0L
-        lastPositionMs = positionMs.coerceAtLeast(0)
+        notePosition(positionMs.coerceAtLeast(0), advancing = false)
         ended = false
         error = null
         prepare(item) { ready ->
@@ -254,7 +266,7 @@ class CastSessionPlayer(
         syncedContentId = null
         finishedContentId = null
         remoteDurationMs = 0L
-        lastPositionMs = 0L
+        notePosition(0L, advancing = false)
         ended = false
         error = null
         val local = player
@@ -288,7 +300,7 @@ class CastSessionPlayer(
         val next = local.nextMediaItemIndex
         if (next == C.INDEX_UNSET) {
             ended = true
-            lastPositionMs = remoteDurationMs.takeIf { it > 0 } ?: lastPositionMs
+            notePosition(remoteDurationMs.takeIf { it > 0 } ?: lastPositionMs, advancing = false)
             invalidateState()
             return
         }
@@ -320,7 +332,7 @@ class CastSessionPlayer(
             return
         }
         if (status.contentId != null && status.contentId == loadedContentId) {
-            lastPositionMs = status.positionMs
+            notePosition(status.positionMs, advancing = status.playerState == CastStatus.PlayerState.PLAYING)
             if (status.durationMs > 0) remoteDurationMs = status.durationMs
             val playing = status.playerState == CastStatus.PlayerState.PLAYING
             if (syncedContentId != loadedContentId && (playing || status.playerState == CastStatus.PlayerState.PAUSED)) {
@@ -387,8 +399,21 @@ class CastSessionPlayer(
         ) {
             status.positionMs
         } else {
-            lastPositionMs
+            extrapolatedPositionMs()
         }
+    }
+
+    private fun notePosition(positionMs: Long, advancing: Boolean) {
+        lastPositionMs = positionMs
+        positionTakenAtMs = clock()
+        positionAdvancing = advancing
+    }
+
+    /** [lastPositionMs], moved on by the time since while the song was playing (see [positionTakenAtMs]). */
+    private fun extrapolatedPositionMs(): Long {
+        if (!positionAdvancing || !wantPlay || ended) return lastPositionMs
+        val moved = lastPositionMs + (clock() - positionTakenAtMs).coerceAtLeast(0)
+        return if (remoteDurationMs > 0) minOf(moved, remoteDurationMs) else moved
     }
 
     // ── State ───────────────────────────────────────────────────────────
@@ -496,7 +521,7 @@ class CastSessionPlayer(
     override fun handleStop(): ListenableFuture<*> {
         val target = remote ?: return super.handleStop()
         target.stop()
-        lastPositionMs = currentPositionMs()
+        notePosition(currentPositionMs(), advancing = false)
         loadedMediaId = null
         loadedContentId = null
         dropQueued()
@@ -515,7 +540,7 @@ class CastSessionPlayer(
                 status.playerState != CastStatus.PlayerState.IDLE
             ) {
                 target.seekTo(position)
-                lastPositionMs = position
+                notePosition(position, positionAdvancing)
             } else {
                 // Finished, failed or stopped: seeking starts it again from there.
                 load(position)

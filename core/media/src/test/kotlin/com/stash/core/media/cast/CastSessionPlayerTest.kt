@@ -593,6 +593,37 @@ class CastSessionPlayerTest {
         assertThat(player.playWhenReady).isTrue()
     }
 
+    @Test fun `once the session is torn down, the position keeps moving from the last status`() {
+        val local = QueuePlayer(listOf("a"))
+        val remote = FakeRemote()
+        val player = cast(local, remote)
+        remote.report(CastStatus.PlayerState.PLAYING, positionMs = 30_000L, durationMs = 200_000L)
+
+        // The receiver sends nothing while it plays; then the SDK drops the
+        // media client (suspend, end) and the status carries no song at all.
+        now += 45_000
+        remote.status = CastStatus.EMPTY
+
+        assertThat(player.currentPosition).isEqualTo(75_000L)
+        assertThat(player.detach().positionMs).isEqualTo(75_000L)
+    }
+
+    @Test fun `a paused song's position doesn't move on, and a playing one stops at its end`() {
+        val remote = FakeRemote()
+        val player = cast(QueuePlayer(listOf("a")), remote)
+        remote.report(CastStatus.PlayerState.PAUSED, positionMs = 30_000L, durationMs = 200_000L)
+        player.pause()
+        now += 45_000
+        remote.status = CastStatus.EMPTY
+        assertThat(player.currentPosition).isEqualTo(30_000L)
+
+        player.play()
+        remote.report(CastStatus.PlayerState.PLAYING, positionMs = 190_000L, durationMs = 200_000L)
+        now += 60_000
+        remote.status = CastStatus.EMPTY
+        assertThat(player.currentPosition).isEqualTo(200_000L)
+    }
+
     @Test fun `detaching hands back the speaker's song and position`() {
         val local = QueuePlayer(listOf("a", "b"))
         val remote = FakeRemote()
