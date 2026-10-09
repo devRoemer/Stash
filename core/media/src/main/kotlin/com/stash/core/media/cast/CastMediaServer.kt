@@ -491,13 +491,13 @@ class CastMediaServer(
                 ?.second
         }
 
-        /** Monotonic milliseconds; System.nanoTime so it runs under plain JVM tests too. */
         /** 192.0.0.0/29: the address 464XLAT gives an IPv6-only network's IPv4 shim. No speaker can reach it. */
         private fun isClatAddress(address: InetAddress): Boolean {
             val b = address.address
             return b.size == 4 && b[0] == 192.toByte() && b[1] == 0.toByte() && b[2] == 0.toByte() && (b[3].toInt() and 0xF8) == 0
         }
 
+        /** Monotonic milliseconds; System.nanoTime so it runs under plain JVM tests too. */
         private fun nowMs(): Long = System.nanoTime() / 1_000_000
 
         private fun readFully(source: DataSource, into: ByteArray, max: Int): Int {
