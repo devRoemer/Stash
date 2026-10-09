@@ -30,7 +30,7 @@
 `StashPlaybackService` watches `CastDevices.remote`. When a receiver connects, the service runs `enterCast`:
 1. Suspends crossfade, the same way Listen Together does.
 2. Pauses the master ExoPlayer and `stop()`s it. The queue and position stay, but nothing plays or buffers locally.
-3. Starts `CastMediaServer` and takes a partial wake lock and a Wi-Fi lock. The phone's CPU and Wi-Fi must stay awake to serve audio while the screen is off.
+3. Starts `CastMediaServer` and takes a partial wake lock and a Wi-Fi lock. The phone's CPU and Wi-Fi must stay awake to serve audio while the screen is off. The locks are held only while the speaker plays: a pause, the end of the queue or a speaker error lets them go, and play takes them again.
 4. Wraps the master in `CastSessionPlayer` and sets it as `mediaSession.player`.
 
 Every controller (Now Playing, the notification, the lock screen, Bluetooth, Android Auto) now drives the wrapper:
