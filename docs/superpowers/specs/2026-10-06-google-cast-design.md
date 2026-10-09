@@ -89,4 +89,5 @@ The idle-stop countdown and the prefetch poll read the wrapper while casting. Wi
 
 - The phone has to stay on the same Wi-Fi as the speaker. If it changes networks, the speaker stops.
 - Since Android 14, the Wi-Fi lock does nothing while the screen is off: the platform turns it into a low-latency lock, which needs the app in the foreground. Media3's own streaming lock has the same limit. Wi-Fi power save can then slow the server's replies, but the connection stays.
+- The 30-minute idle stop counts only the time the phone is awake: its countdown is a coroutine `delay`, and a paused speaker holds no wake lock. With the screen off it can fire later. An exact stop would need an `AlarmManager` alarm.
 - Opening casting from the system output switcher, rather than from our button, isn't wired yet.
