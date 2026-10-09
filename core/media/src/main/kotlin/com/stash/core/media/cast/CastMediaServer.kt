@@ -203,6 +203,9 @@ class CastMediaServer(
     }
 
     private fun acceptLoop(socket: ServerSocket, pool: ExecutorService) {
+        // Noted once per stretch of refusals, so a flood can't push everything
+        // else out of the diagnostics' few cast events.
+        var refusing = false
         while (!socket.isClosed) {
             val client = try {
                 socket.accept()
@@ -213,8 +216,14 @@ class CastMediaServer(
                 // Far more than a speaker opens (the song, the next one, their
                 // covers, a few draining after seeks): someone else is flooding us.
                 runCatching { client.close() }
+                if (!refusing) {
+                    refusing = true
+                    Log.w(TAG, "connection limit ($maxClients) reached — refusing new connections")
+                    onEvent("server: connection limit reached, refusing connections")
+                }
                 continue
             }
+            refusing = false
             clients += client
             try {
                 pool.execute {

@@ -288,10 +288,14 @@ class CastMediaServerTest {
         }
     }
 
+    /** What the guarded server reported for the diagnostics bundle. */
+    private val guardedEvents: MutableList<String> = java.util.Collections.synchronizedList(mutableListOf())
+
     private fun guarded(maxClients: Int = 16, headerTimeoutMs: Int = 5_000) = CastMediaServer(
         audioSource = { ByteArrayDataSource(song) },
         artworkSource = { ByteArrayDataSource(song) },
         bindAddress = { InetAddress.getLoopbackAddress() },
+        onEvent = { guardedEvents += it },
         maxClients = maxClients,
         headerTimeoutMs = headerTimeoutMs,
     )
@@ -314,6 +318,9 @@ class CastMediaServerTest {
             Thread.sleep(300) // both accepted and waiting for a request
 
             Socket(url.host, url.port).use { extra -> assertThat(msUntilClosed(extra)).isLessThan(2_000L) }
+            Socket(url.host, url.port).use { extra -> assertThat(msUntilClosed(extra)).isLessThan(2_000L) }
+            // Refusals show in the diagnostics, once per stretch, not once per connection.
+            assertThat(guardedEvents.count { it == "server: connection limit reached, refusing connections" }).isEqualTo(1)
 
             idle.forEach { it.close() }
             // The idle ones' slots free up as their handlers see the close.
